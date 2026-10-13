@@ -1,0 +1,39 @@
+{
+  "name": "litmus",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "lint": "eslint .",
+    "typecheck": "nuxt typecheck",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "backtest": "S=/tmp/litmus-backtest-$$.sock; BACKTEST=1 NITRO_UNIX_SOCKET=$S node --env-file-if-exists=.env .output/server/index.mjs; c=$?; rm -f $S; exit $c"
+  },
+  "dependencies": {
+    "@iconify-json/lucide": "^1.2.139",
+    "@nuxt/ui": "^4.11.3",
+    "@vueuse/core": "^15.0.0",
+    "chart.js": "^4.5.1",
+    "decimal.js": "^10.6.0",
+    "nuxt": "^4.6.0",
+    "tailwindcss": "^4.3.3",
+    "vue-chartjs": "^5.3.4",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@nuxt/eslint": "^1.17.0",
+    "@nuxt/test-utils": "^4.3.3",
+    "@types/node": "^24.19.1",
+    "eslint": "^10.12.0",
+    "eslint-plugin-better-tailwindcss": "^4.7.0",
+    "typescript": "^6.0.3",
+    "vitest": "^5.0.3",
+    "vue-tsc": "^3.3.12"
+  },
+  "packageManager": "pnpm@12.9.1"
+}
