@@ -13,7 +13,7 @@ import { AGENT_COLORS, BASELINE_COLOR, agentInputSchema, agentUpdateSchema, prov
 import { DEFAULT_SEASON_CONFIG, appSettingsSchema, seasonConfigSchema, type AppSettings } from '../../shared/settings'
 import type { AgentAdminView, AgentTestResult, ProviderView, SeasonSummary } from '../../shared/types/api'
 import type { AgentRow, Store } from './db'
-import { buildDecideInput, KLINE_LIMIT, type Engine } from './engine'
+import { buildDecideInput, dailyKlinesFor, KLINE_LIMIT, type Engine } from './engine'
 import { listModels, type Decider } from './llm'
 import { log as defaultLog, redact, type Logger } from './logger'
 import type { Market } from './market'
@@ -220,6 +220,7 @@ export async function testAgent(deps: AdminDeps, id: number): Promise<AgentTestR
       config,
       rules,
       klines,
+      dailyKlines: await dailyKlinesFor(deps.market, config, now),
       price,
       now,
       ledger: { usdt: capital, base: new Decimal(0) },

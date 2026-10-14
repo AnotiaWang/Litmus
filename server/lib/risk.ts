@@ -98,11 +98,15 @@ export const maxOrderUsdt = ({ ledger, price, limits }: Pick<PrecheckInput, 'led
   ledger.usdt.plus(ledger.base.mul(price)).mul(limits.maxOrderPct).div(100)
 
 /** 买入后持币市值不能超过账本总资产的 maxPositionPct%，返回还能买多少 USDT。 */
-function positionRoom({ ledger, price, limits }: PrecheckInput) {
+function positionRoom({ ledger, price, limits }: Pick<PrecheckInput, 'ledger' | 'price' | 'limits'>) {
   const positionValue = ledger.base.mul(price)
   const total = ledger.usdt.plus(positionValue)
   return { positionValue, room: total.mul(limits.maxPositionPct).div(100).minus(positionValue) }
 }
+
+/** 现在最多能买入多少 USDT：单笔上限、账本可用 USDT、仓位上限剩余空间三者取最小（告诉 LLM 用） */
+export const maxBuyUsdt = (input: Pick<PrecheckInput, 'ledger' | 'price' | 'limits'>) =>
+  Decimal.max(0, Decimal.min(maxOrderUsdt(input), input.ledger.usdt, positionRoom(input).room))
 
 export function evaluateRisk(input: RiskInput): RiskResult {
   const { limits, ledger, rules } = input

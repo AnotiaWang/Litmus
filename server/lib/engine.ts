@@ -16,21 +16,23 @@
  */
 import { randomUUID } from 'node:crypto'
 import Decimal from 'decimal.js'
-import type { SeasonConfig } from '../../shared/settings'
+import { INTERVAL_MS, type SeasonConfig } from '../../shared/settings'
 import type { Outcome, RunResult } from '../../shared/types/api'
 import type { AgentRow, Circuit, Decision, DecisionSummary, EntryState, PauseState, SeasonRow, Store } from './db'
 import { applyFill, equityOf, isPosition, paperFill, updatePosition, type Ledger, type Position } from './ledger'
 import { summarizeCalls, type Decider, type DecideInput } from './llm'
 import { log as defaultLog, redact, type Logger } from './logger'
 import type { Kline, Market, SymbolRules } from './market'
-import { dailyLossPct, evaluateRisk, maxOrderUsdt, precheck, type PrecheckInput } from './risk'
-import { BASELINE_PARAMS, checkStop, closedKlines, evaluate, indicatorsOf, marketStats, stopLine } from './strategy'
+import { dailyLossPct, evaluateRisk, maxBuyUsdt, precheck, type PrecheckInput } from './risk'
+import { BASELINE_PARAMS, checkStop, closedKlines, evaluate, marketStats, stopLine } from './strategy'
 
 /** 每轮取的已收盘 K 线根数（均线基线需要 SMA50 + 确认根数，LLM 最多发 100 根） */
 export const KLINE_LIMIT = 100
 /** 发给 LLM 的它自己最近的决策条数、最近成交笔数 */
 const LLM_RECENT_DECISIONS = 10
 const LLM_RECENT_FILLS = 5
+/** 发给 LLM 的日线根数 */
+export const DAILY_KLINES = 14
 
 export type Trigger = 'schedule' | 'manual'
 
@@ -52,6 +54,8 @@ interface TickContext {
   trigger: Trigger
   now: Date
   klines: Kline[]
+  /** 发给 LLM 的日线，不需要时为空（见 dailyKlinesFor） */
+  dailyKlines: Kline[]
   price: Decimal
   rules: SymbolRules
   pause: PauseState
@@ -72,6 +76,15 @@ interface AgentContext extends TickContext {
   /** 是否写入决策记录 */
   record: boolean
   filled: boolean
+}
+
+/**
+ * 发给 LLM 的 K 线覆盖不到 DAILY_KLINES 天时（如 48 根 15m 只有 12 小时），再取最近 DAILY_KLINES 根已收盘日线，
+ * 让模型看到更长周期的走势；覆盖得到就不取。引擎和管理页面的“测试模型”共用。
+ */
+export async function dailyKlinesFor(market: Market, config: SeasonConfig, now: Date): Promise<Kline[]> {
+  if (config.llmKlines * INTERVAL_MS[config.klineInterval] >= DAILY_KLINES * INTERVAL_MS['1d']) return []
+  return closedKlines(await market.getKlines(config.symbol, '1d', DAILY_KLINES + 1), now.getTime()).slice(-DAILY_KLINES)
 }
 
 /** LLM 的询问频率说明，提示词和面板共用 */
@@ -95,6 +108,7 @@ export function buildDecideInput(p: {
   config: SeasonConfig
   rules: SymbolRules
   klines: Kline[]
+  dailyKlines: Kline[]
   price: Decimal
   now: Date
   ledger: Ledger
@@ -115,10 +129,9 @@ export function buildDecideInput(p: {
     now: p.now.toISOString(),
     price: price.toFixed(),
     klines: p.klines.slice(-config.llmKlines),
-    indicators: indicatorsOf(p.klines.map(k => Number(k.close)), BASELINE_PARAMS),
-    periods: BASELINE_PARAMS,
+    dailyKlines: p.dailyKlines,
     stats: marketStats(p.klines),
-    ledger: { usdt: ledger.usdt.toFixed(), base: ledger.base.toFixed(), positionValue: ledger.base.mul(price).toFixed(2), equity: p.equity.toFixed(2) },
+    ledger: { usdt: ledger.usdt.toFixed(2), base: ledger.base.toFixed(), positionValue: ledger.base.mul(price).toFixed(2), equity: p.equity.toFixed(2) },
     position: position && entryPrice
       ? {
           entryPrice: entryPrice.toSignificantDigits(10).toFixed(),
@@ -129,7 +142,7 @@ export function buildDecideInput(p: {
       : null,
     stopRules: { stopLossPct: config.risk.stopLossPct, trailingStopPct: config.risk.trailingStopPct },
     limits: {
-      maxOrderUsdt: maxOrderUsdt({ ledger, price, limits: config.risk }).toFixed(2),
+      maxBuyUsdt: maxBuyUsdt({ ledger, price, limits: config.risk }).toDecimalPlaces(2, Decimal.ROUND_DOWN).toFixed(2),
       maxOrderPct: config.risk.maxOrderPct,
       minOrderUsdt: p.rules.minNotional.toFixed(),
       maxPositionPct: config.risk.maxPositionPct
@@ -212,9 +225,15 @@ export class Engine {
     if (!season) return { status: 'done', tickId: null, error: '没有进行中的赛季', outcomes: [] }
     const config = season.config
     const now = this.now()
+    const agents = new Map(store.listAgents().map(a => [a.id, a]))
+    const playing = store.listEntries(season.id)
+      .filter(e => !e.leftAt)
+      .map(e => agents.get(e.agentId))
+      .filter((a): a is AgentRow => a?.status === 'active')
 
     let rules: SymbolRules
     let klines: Kline[]
+    let dailyKlines: Kline[] = []
     let price: Decimal
     try {
       rules = await market.getSymbolRules(config.symbol)
@@ -223,6 +242,7 @@ export class Engine {
       const raw = await market.getKlines(config.symbol, config.klineInterval, KLINE_LIMIT + 1)
       klines = closedKlines(raw, now.getTime()).slice(-KLINE_LIMIT)
       if (!klines.length) throw new Error('没有取到已收盘的 K 线')
+      if (playing.some(a => a.kind === 'llm')) dailyKlines = await dailyKlinesFor(market, config, now)
       price = await market.getPrice(config.symbol)
     } catch (e) {
       const error = `取行情失败，本轮跳过：${redact((e as Error).message)}`
@@ -232,12 +252,7 @@ export class Engine {
     }
 
     const tickId = store.insertTick({ seasonId: season.id, at: now.toISOString(), trigger, price: price.toFixed(), error: null })
-    const ctx: TickContext = { season, config, tickId, trigger, now, klines, price, rules, pause: store.getPause() }
-    const agents = new Map(store.listAgents().map(a => [a.id, a]))
-    const playing = store.listEntries(season.id)
-      .filter(e => !e.leftAt)
-      .map(e => agents.get(e.agentId))
-      .filter((a): a is AgentRow => a?.status === 'active')
+    const ctx: TickContext = { season, config, tickId, trigger, now, klines, dailyKlines, price, rules, pause: store.getPause() }
     this.log.info(`第 ${tickId} 轮开始（${trigger === 'manual' ? '手动' : '定时'}）：${config.symbol} ${price.toFixed()}，${playing.length} 个模型`)
     const outcomes = await Promise.all(playing.map(agent => this.agentRound(ctx, agent)))
     this.log.info(`第 ${tickId} 轮结束：${outcomes.map(o => `${agents.get(o.agentId)!.name} ${o.outcome}`).join('，') || '没有参赛模型'}`)
@@ -361,7 +376,7 @@ export class Engine {
    * 每根 K 线收盘后只问一次，手动运行不受限制。LLM 没给出合法结果时这根 K 线不算问过，下一轮重试。
    */
   private async llmRound(ctx: AgentContext): Promise<Outcome> {
-    const { config, state, decision: d, agent, klines, price, ledger, rules, hasPosition, position, now } = ctx
+    const { config, state, decision: d, agent, klines, dailyKlines, price, ledger, rules, hasPosition, position, now } = ctx
     const entryPrice = position ? position.cost.div(ledger.base) : null
 
     const stop = checkStop(config.risk, {
@@ -398,6 +413,7 @@ export class Engine {
       config,
       rules,
       klines,
+      dailyKlines,
       price,
       now,
       ledger,

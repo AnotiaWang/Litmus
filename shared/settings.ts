@@ -13,6 +13,20 @@ import { z } from 'zod'
 export const KLINE_INTERVALS = ['15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'] as const
 export type KlineInterval = typeof KLINE_INTERVALS[number]
 
+const MINUTE = 60_000
+/** K 线周期对应的毫秒数 */
+export const INTERVAL_MS: Record<KlineInterval, number> = {
+  '15m': 15 * MINUTE,
+  '30m': 30 * MINUTE,
+  '1h': 60 * MINUTE,
+  '2h': 120 * MINUTE,
+  '4h': 240 * MINUTE,
+  '6h': 360 * MINUTE,
+  '8h': 480 * MINUTE,
+  '12h': 720 * MINUTE,
+  '1d': 1440 * MINUTE
+}
+
 /** 发给 LLM 的 K 线最多多少根（引擎每轮取 100 根） */
 export const LLM_KLINES_MAX = 100
 

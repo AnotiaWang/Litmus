@@ -175,6 +175,9 @@ export class MockMarket implements Market {
     minNotional: new Decimal('5')
   }
 
+  /** 按周期单独指定的 K 线（如 1d），没指定的周期都返回 klines */
+  intervalKlines: Partial<Record<string, Kline[]>> = {}
+
   /** 设置后，下一次调用对应方法会抛出这个错误 */
   failOn: Partial<Record<'getKlines' | 'getPrice', Error>> = {}
 
@@ -182,9 +185,9 @@ export class MockMarket implements Market {
     return this.rules
   }
 
-  async getKlines(_symbol: string, _interval: string, limit: number): Promise<Kline[]> {
+  async getKlines(_symbol: string, interval: string, limit: number): Promise<Kline[]> {
     this.maybeFail('getKlines')
-    return this.klines.slice(-limit)
+    return (this.intervalKlines[interval] ?? this.klines).slice(-limit)
   }
 
   async getPrice(): Promise<Decimal> {

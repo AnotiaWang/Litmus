@@ -39,7 +39,7 @@ describe('行情摘要', () => {
     expect(atr(klines.slice(0, 14), 14)).toBeNaN()
   })
 
-  it('统计最近 24 小时的涨跌、高低和成交量倍数；K 线不够 24 小时时取全部', () => {
+  it('统计最近 24 小时的涨跌、高低、离高低点的距离、更短时段的涨跌和成交量倍数；K 线不够 24 小时时取全部', () => {
     const klines = makeKlines(Array.from({ length: 30 }, (_, i) => 100 + i), Date.UTC(2026, 9, 8))
     klines.at(-1)!.volume = '3'
     const s = marketStats(klines)
@@ -48,10 +48,18 @@ describe('行情摘要', () => {
     expect(s.high).toBeCloseTo(129 * 1.01)
     expect(s.low).toBeCloseTo(106 * 0.99)
     expect(s.volumeRatio).toBe(3)
+    expect(s.changes.map(c => c.hours)).toEqual([1, 4, 12])
+    expect(s.changes[0]!.pct).toBeCloseTo(0)
+    expect(s.changes[1]!.pct).toBeCloseTo((129 - 126) / 126 * 100)
+    expect(s.changes[2]!.pct).toBeCloseTo((129 - 118) / 118 * 100)
+    expect(s.fromHighPct).toBeCloseTo((129 - 129 * 1.01) / (129 * 1.01) * 100)
+    expect(s.fromLowPct).toBeCloseTo((129 - 106 * 0.99) / (106 * 0.99) * 100)
 
     const short = marketStats(klines.slice(0, 10))
     expect(short.hours).toBe(10)
     expect(short.volumeRatio).toBeNaN()
+    // 12 小时超出了统计区间
+    expect(short.changes.map(c => c.hours)).toEqual([1, 4])
   })
 })
 

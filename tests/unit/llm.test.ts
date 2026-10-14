@@ -13,13 +13,12 @@ const input: DecideInput = {
   now: '2026-10-08T12:00:00.000Z',
   price: '60000',
   klines,
-  indicators: { close: 60000, smaFast: 59000, smaSlow: 58900, prevSmaFast: 58800, prevSmaSlow: 58850, rsi: 55 },
-  periods: { smaFast: 20, smaSlow: 50, rsiPeriod: 14 },
+  dailyKlines: [],
   stats: marketStats(klines),
-  ledger: { usdt: '40', base: '0.001', positionValue: '60.00', equity: '100.00' },
+  ledger: { usdt: '40.00', base: '0.001', positionValue: '60.00', equity: '100.00' },
   position: { entryPrice: '58000', pnlPct: '3.45', peakPrice: '61000', stopPrice: '55100' },
   stopRules: { stopLossPct: 5, trailingStopPct: 0 },
-  limits: { maxOrderUsdt: '50.00', maxOrderPct: 50, minOrderUsdt: '5', maxPositionPct: 80 },
+  limits: { maxBuyUsdt: '20.00', maxOrderPct: 50, minOrderUsdt: '5', maxPositionPct: 80 },
   blocked: { buy: '交易冷却时间：距上一笔成交仅 10 分钟，需间隔 60 分钟', sell: null },
   recentDecisions: [{ time: '2026-10-08T08:00:00.000Z', price: '58000', action: 'buy', sizePct: 60, outcome: 'filled', reason: '趋势向上' }],
   recentFills: [{ time: '2026-10-08T08:00:00.000Z', side: 'buy', price: '58000', qty: '0.001', quote: '58' }]
@@ -46,39 +45,52 @@ describe('解析 LLM 决策', () => {
 })
 
 describe('提示词', () => {
-  it('包含询问频率、账本、持仓、止损、限额、能否买卖、指标、K 线和最近的决策', () => {
+  it('包含询问频率、账本、持仓、止损、限额、能否买卖、行情摘要、K 线和最近的决策', () => {
     const prompt = buildDecidePrompt(input)
     for (const s of [
       'BTCUSDT',
       '当前时间（UTC）：2026-10-08 12:00',
       '每根 4h K 线收盘后询问你一次',
-      '可用 40 USDT，持有 0.001 BTC（市值 60.00 USDT），总资产 100.00 USDT',
+      '可用 40.00 USDT，持有 0.001 BTC（市值 60.00 USDT），总资产 100.00 USDT',
       '持仓均价 58000（含手续费），浮动盈亏 3.45%',
       '当前止损线 55100',
       '跌破持仓均价 5% 止损，移动止损关闭',
-      '单笔买入最多 50.00 USDT（总资产的 50%）',
-      '最小下单额 5 USDT',
-      '持币市值不超过总资产的 80%',
+      '单笔买入不超过总资产的 50%，持币市值不超过总资产的 80%，每笔不能低于交易所最小下单额 5 USDT；算上可用 USDT，现在最多还能买入 20.00 USDT',
       '现在能否买入：不可以（交易冷却时间',
       '现在能否卖出：可以',
-      'SMA20 59000（上一根 58800），SMA50 58900（上一根 58850），RSI14 55.0',
-      '最近 24 小时：涨跌 0.39%，最高 59822.3，最低 58410',
+      '涨跌幅：最近 1 小时 +0.00%，最近 4 小时 +0.05%，最近 12 小时 +0.19%，最近 24 小时 +0.39%',
+      '最近 24 小时最高 59822.3，最低 58410；最新收盘比最高 -0.99%，比最低 +1.40%',
       'ATR14',
       '最新一根成交量是之前 20 根平均的 1.00 倍',
-      '最近 24 根 4h K 线',
-      '2026-10-07 23:00 开59230 高59822.3 低58637.7 收59230 量1',
-      '2026-10-08 08:00 价格58000 买入 60% 结果已成交 理由：趋势向上',
-      '买入 0.001 BTC，金额 58 USDT'
+      '最近 24 根 4h K 线（UTC 开盘时间；每行依次是时间、开、高、低、收、成交量）：',
+      '\n10-07 23:00 59230 59822.3 58637.7 59230 1\n',
+      '10-08 08:00 价格58000 买入 60% 结果已成交 理由：趋势向上',
+      '10-08 08:00 买入 0.001 BTC，金额 58.00 USDT，价格 58000'
     ]) {
       expect(prompt).toContain(s)
     }
   })
 
-  it('交易所返回值的尾零去掉，数据不足的指标注明', () => {
+  it('不给均线、RSI 这类基线用的指标；没有日线时不写日线', () => {
+    const prompt = buildDecidePrompt(input)
+    for (const s of ['SMA', 'RSI', '均线', '日线']) expect(prompt).not.toContain(s)
+  })
+
+  it('附上日线时放在主 K 线前面，只写日期', () => {
+    const day = 86_400_000
+    const daily = [2, 1].map(n => ({ ...klines[0]!, openTime: Date.UTC(2026, 9, 8) - n * day, closeTime: Date.UTC(2026, 9, 8) - (n - 1) * day - 1, open: '58000', high: '61000', low: '57000', close: '60000', volume: '12345.678' }))
+    const prompt = buildDecidePrompt({ ...input, dailyKlines: daily })
+    expect(prompt).toContain('最近 2 根日线（UTC 日期，已收盘；每行依次是日期、开、高、低、收、成交量）：\n10-06 58000 61000 57000 60000 12345.7\n10-07 58000')
+    expect(prompt.indexOf('根日线')).toBeLessThan(prompt.indexOf('最近 24 根 4h K 线'))
+  })
+
+  it('交易所返回值的尾零去掉；数据不足算不出的统计量不写', () => {
     const k = { ...klines.at(-1)!, open: '83102.00000000', high: '83173.29000000', low: '83099.34000000', close: '83129.92000000', volume: '186.14116000' }
-    const prompt = buildDecidePrompt({ ...input, klines: [k], indicators: { ...input.indicators, smaSlow: Number.NaN } })
-    expect(prompt).toContain('开83102 高83173.29 低83099.34 收83129.92 量186.141')
-    expect(prompt).toContain('SMA50 数据不足')
+    const prompt = buildDecidePrompt({ ...input, klines: [k], stats: marketStats([k]) })
+    expect(prompt).toContain('83102 83173.29 83099.34 83129.92 186.141')
+    expect(prompt).toContain('涨跌幅：最近 1 小时 +0.03%\n')
+    expect(prompt).not.toContain('ATR14')
+    expect(prompt).not.toContain('成交量是之前')
   })
 
   it('空仓、止损关闭时写明', () => {
@@ -90,6 +102,7 @@ describe('提示词', () => {
 
   it('系统提示词是中性的目标描述；输出格式先写理由再给结论', () => {
     expect(DECIDE_SYSTEM_PROMPT).not.toContain('激进')
+    expect(DECIDE_SYSTEM_PROMPT).not.toContain('指标')
     expect(DECIDE_SYSTEM_PROMPT).toContain('按收益比较成绩，回撤也会被统计')
     expect(DECIDE_SYSTEM_PROMPT.indexOf('"reason"')).toBeLessThan(DECIDE_SYSTEM_PROMPT.indexOf('"action"'))
   })

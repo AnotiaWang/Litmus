@@ -1,7 +1,7 @@
 import Decimal from 'decimal.js'
 import { describe, expect, it } from 'vitest'
 import type { SymbolRules } from '../../server/lib/market'
-import { evaluateRisk, maxOrderUsdt, precheck, type RiskInput } from '../../server/lib/risk'
+import { evaluateRisk, maxBuyUsdt, maxOrderUsdt, precheck, type RiskInput } from '../../server/lib/risk'
 import { FIXTURE_RISK } from './helpers'
 
 const rules: SymbolRules = {
@@ -53,6 +53,16 @@ describe('风控 · 买入', () => {
     expect(r.passed).toBe(true)
     expect(r.quoteAmount!.toFixed()).toBe('10')
     expect(r.reason).toContain('仓位上限')
+  })
+
+  it('现在最多能买多少：单笔上限和仓位上限剩余空间取最小，不小于 0', () => {
+    const price = new Decimal(50000)
+    // 单笔上限 50，可用 100
+    expect(maxBuyUsdt({ ledger: { usdt: new Decimal(100), base: new Decimal(0) }, price, limits: FIXTURE_RISK }).toFixed()).toBe('50')
+    // 持币 40 + 现金 60：仓位上限 50 只剩 10
+    expect(maxBuyUsdt({ ledger: { usdt: new Decimal(60), base: new Decimal('0.0008') }, price, limits: FIXTURE_RISK }).toFixed()).toBe('10')
+    // 仓位已超上限
+    expect(maxBuyUsdt({ ledger: { usdt: new Decimal(20), base: new Decimal('0.0016') }, price, limits: FIXTURE_RISK }).toFixed()).toBe('0')
   })
 
   it('仓位已满时拦截', () => {

@@ -15,49 +15,66 @@ import Decimal from 'decimal.js'
 import { z } from 'zod'
 import type { LlmCall, LlmPrompt, LlmStatus } from '../../shared/types/api'
 import type { Kline } from './market'
-import type { Indicators, MarketStats, StrategyParams } from './strategy'
+import type { MarketStats, StrategyParams } from './strategy'
 
-/** 行情部分：K 线和程序算好的指标、摘要 */
+/** 行情部分：K 线和程序算好的行情摘要 */
 export interface MarketInput {
   klineInterval: string
   /** 最近若干根已收盘 K 线 */
   klines: Kline[]
-  indicators: Indicators
-  periods: Pick<StrategyParams, 'smaFast' | 'smaSlow' | 'rsiPeriod'>
+  /** 上面的 K 线覆盖不到两周时附上的最近若干根已收盘日线，让模型看到更长周期的走势；否则为空 */
+  dailyKlines: Kline[]
   stats: MarketStats
 }
 
 const ACTION_LABELS = { buy: '买入', sell: '卖出', hold: '观望' } as const
 const OUTCOME_LABELS: Record<string, string> = { hold: '观望', filled: '已成交', risk_block: '风控拦截', paused: '暂停中', error: '出错' }
 
-/** 时间统一写成 2026-10-08 08:00（UTC），提示词里各处一致 */
+/** 时间都是 UTC。当前时间写完整的 2026-10-08 08:00；K 线、决策和成交列表里省略年份（10-08 08:00），省 token */
 const fmtTime = (t: number | string) => new Date(t).toISOString().slice(0, 16).replace('T', ' ')
+const fmtShort = (t: number | string) => new Date(t).toISOString().slice(5, 16).replace('T', ' ')
+const fmtDay = (t: number | string) => new Date(t).toISOString().slice(5, 10)
 /** 去掉交易所返回值的尾零，如 83102.00000000 → 83102 */
 const trim = (v: string) => new Decimal(v).toFixed()
 /** 算不出来（数据不足）时注明 */
 const trimOpt = (v: string | null) => v ? trim(v) : '-'
 /** 程序算出的统计量保留 6 位有效数字 */
 const fmtNum = (n: number) => Number.isFinite(n) ? new Decimal(n).toSignificantDigits(6).toFixed() : '数据不足'
+/** 涨跌幅带正负号 */
+const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+/** USDT 金额保留两位小数 */
+const fmtUsdt = (v: string | null) => v ? new Decimal(v).toFixed(2) : '-'
 
-function klineLines(klines: Kline[]): string {
+/** 一根 K 线一行：时间 开 高 低 收 成交量（列名写在表头，不在每行重复） */
+function klineLines(klines: Kline[], time: (t: number) => string): string {
   return klines.map(k =>
-    `${fmtTime(k.openTime)} 开${trim(k.open)} 高${trim(k.high)} 低${trim(k.low)} 收${trim(k.close)} 量${new Decimal(k.volume).toSignificantDigits(6).toFixed()}`
+    `${time(k.openTime)} ${trim(k.open)} ${trim(k.high)} ${trim(k.low)} ${trim(k.close)} ${new Decimal(k.volume).toSignificantDigits(6).toFixed()}`
   ).join('\n')
 }
 
+/**
+ * 行情摘要只给描述行情的统计量（涨跌、高低点、波动、成交量），不给均线、RSI 这类指标：
+ * 它们是均线基线的判断依据，又各自带着现成的买卖规则（金叉死叉、超买超卖），给了 LLM 会被直接套用，
+ * 各模型的决策跟着趋同，比出来的就不是模型自己的判断了。
+ */
 function marketText(m: MarketInput): string {
-  const { indicators: ind, periods: p, stats } = m
+  const { stats } = m
+  const hours = Number(stats.hours.toFixed(1))
+  const close = Number(m.klines.at(-1)!.close)
   const lines = [
-    `- 最近 ${Number(stats.hours.toFixed(1))} 小时：涨跌 ${stats.changePct.toFixed(2)}%，最高 ${fmtNum(stats.high)}，最低 ${fmtNum(stats.low)}`,
-    `- SMA${p.smaFast} ${fmtNum(ind.smaFast)}（上一根 ${fmtNum(ind.prevSmaFast)}），SMA${p.smaSlow} ${fmtNum(ind.smaSlow)}（上一根 ${fmtNum(ind.prevSmaSlow)}），RSI${p.rsiPeriod} ${Number.isFinite(ind.rsi) ? ind.rsi.toFixed(1) : '数据不足'}`
+    `- 涨跌幅：${[...stats.changes, { hours, pct: stats.changePct }].map(c => `最近 ${c.hours} 小时 ${fmtPct(c.pct)}`).join('，')}`,
+    `- 最近 ${hours} 小时最高 ${fmtNum(stats.high)}，最低 ${fmtNum(stats.low)}；最新收盘比最高 ${fmtPct(stats.fromHighPct)}，比最低 ${fmtPct(stats.fromLowPct)}`
   ]
-  if (Number.isFinite(stats.atr)) lines.push(`- ATR14 ${fmtNum(stats.atr)}（约为价格的 ${(stats.atr / ind.close * 100).toFixed(2)}%）`)
+  if (Number.isFinite(stats.atr)) lines.push(`- ATR14 ${fmtNum(stats.atr)}（约为价格的 ${(stats.atr / close * 100).toFixed(2)}%）`)
   if (Number.isFinite(stats.volumeRatio)) lines.push(`- 最新一根成交量是之前 20 根平均的 ${stats.volumeRatio.toFixed(2)} 倍`)
+  const daily = m.dailyKlines.length
+    ? `\n\n最近 ${m.dailyKlines.length} 根日线（UTC 日期，已收盘；每行依次是日期、开、高、低、收、成交量）：\n${klineLines(m.dailyKlines, fmtDay)}`
+    : ''
   return `行情摘要（${m.klineInterval} K 线，程序根据已收盘 K 线计算）：
-${lines.join('\n')}
+${lines.join('\n')}${daily}
 
-最近 ${m.klines.length} 根 ${m.klineInterval} K 线（UTC 开盘时间）：
-${klineLines(m.klines)}`
+最近 ${m.klines.length} 根 ${m.klineInterval} K 线（UTC 开盘时间；每行依次是时间、开、高、低、收、成交量）：
+${klineLines(m.klines, fmtShort)}`
 }
 
 function stopRulesText({ stopLossPct, trailingStopPct }: DecideInput['stopRules']): string {
@@ -78,8 +95,8 @@ export interface DecideInput extends MarketInput {
   /** 空仓时为 null */
   position: { entryPrice: string, pnlPct: string, peakPrice: string, stopPrice: string | null } | null
   stopRules: Pick<StrategyParams, 'stopLossPct' | 'trailingStopPct'>
-  /** maxOrderUsdt 由 maxOrderPct × 总资产算出；minOrderUsdt：交易所最小下单额 */
-  limits: { maxOrderUsdt: string, maxOrderPct: number, minOrderUsdt: string, maxPositionPct: number }
+  /** maxBuyUsdt：单笔上限、可用 USDT、仓位上限三者取最小后，现在最多能买多少；minOrderUsdt：交易所最小下单额 */
+  limits: { maxBuyUsdt: string, maxOrderPct: number, minOrderUsdt: string, maxPositionPct: number }
   /** 现在不能买入 / 卖出的原因；可以时为 null */
   blocked: { buy: string | null, sell: string | null }
   recentDecisions: Array<{ time: string, price: string | null, action: string, sizePct: number | null, outcome: string, reason: string | null }>
@@ -115,7 +132,7 @@ export const DECIDE_SYSTEM_PROMPT = `你是一名加密货币现货交易员，�
 4. 程序会在你的决定之上执行风控（单笔上限、仓位上限、每日次数、冷却时间、亏损熔断），风控只会调小金额或拦下交易。提示词里会写明现在哪些操作不可用。
 5. 程序每轮都会检查止损线，跌破时自动全部卖出；你也可以随时主动卖出。
 6. 每笔下单金额不能低于交易所最小下单额，比例太小时这笔不会下单；卖出后剩下的币低于最小下单额也卖不掉。
-7. 提示词里的指标和行情摘要由程序算好，可以直接引用，不必自己从 K 线推算。
+7. 提示词里的行情摘要由程序算好，可以直接引用，不必自己从 K 线推算。
 
 只输出一个 JSON 对象，不要输出其他文字。先写理由再给结论，格式如下：
 {"reason": "中文理由，100字以内，指出具体依据", "action": "buy" 或 "sell" 或 "hold", "size_pct": 0到100的数字, "confidence": 0到1的数字，表示你对这个判断的把握，0.5 表示拿不准}`
@@ -128,11 +145,11 @@ export function buildDecidePrompt(input: DecideInput): string {
   const can = (reason: string | null) => reason ? `不可以（${reason}）` : '可以'
   const recent = input.recentDecisions.length
     ? input.recentDecisions.map(d =>
-        `${fmtTime(d.time)} 价格${trimOpt(d.price)} ${ACTION_LABELS[d.action as keyof typeof ACTION_LABELS] ?? d.action}${d.sizePct ? ` ${d.sizePct}%` : ''} 结果${OUTCOME_LABELS[d.outcome] ?? d.outcome} 理由：${d.reason ?? '-'}`
+        `${fmtShort(d.time)} 价格${trimOpt(d.price)} ${ACTION_LABELS[d.action as keyof typeof ACTION_LABELS] ?? d.action}${d.sizePct ? ` ${d.sizePct}%` : ''} 结果${OUTCOME_LABELS[d.outcome] ?? d.outcome} 理由：${d.reason ?? '-'}`
       ).join('\n')
     : '（暂无）'
   const fills = input.recentFills.length
-    ? input.recentFills.map(f => `${fmtTime(f.time)} ${ACTION_LABELS[f.side]} ${trimOpt(f.qty)} ${input.baseAsset}，金额 ${trimOpt(f.quote)} USDT，价格 ${trimOpt(f.price)}`).join('\n')
+    ? input.recentFills.map(f => `${fmtShort(f.time)} ${ACTION_LABELS[f.side]} ${trimOpt(f.qty)} ${input.baseAsset}，金额 ${fmtUsdt(f.quote)} USDT，价格 ${trimOpt(f.price)}`).join('\n')
     : '（暂无）'
   return `交易对：${input.symbol}
 当前时间（UTC）：${fmtTime(input.now)}
@@ -142,7 +159,7 @@ export function buildDecidePrompt(input: DecideInput): string {
 账本：可用 ${input.ledger.usdt} USDT，持有 ${input.ledger.base} ${input.baseAsset}（市值 ${input.ledger.positionValue} USDT），总资产 ${input.ledger.equity} USDT
 持仓：${positionText}
 止损规则：${stopRulesText(input.stopRules)}
-风控限制：单笔买入最多 ${input.limits.maxOrderUsdt} USDT（总资产的 ${input.limits.maxOrderPct}%）；每笔不能低于交易所最小下单额 ${input.limits.minOrderUsdt} USDT；持币市值不超过总资产的 ${input.limits.maxPositionPct}%
+风控限制：单笔买入不超过总资产的 ${input.limits.maxOrderPct}%，持币市值不超过总资产的 ${input.limits.maxPositionPct}%，每笔不能低于交易所最小下单额 ${input.limits.minOrderUsdt} USDT；算上可用 USDT，现在最多还能买入 ${input.limits.maxBuyUsdt} USDT
 现在能否买入：${can(input.blocked.buy)}
 现在能否卖出：${can(input.blocked.sell)}
 

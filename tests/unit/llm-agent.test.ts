@@ -1,6 +1,6 @@
 /** LLM 模型：用模拟行情和模拟 LLM 跑完整的一轮 */
 import Decimal from 'decimal.js'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { setSecrets } from '../../server/lib/logger'
 import { flatCloses, makeKlines, minutesLater, NOW, PROVIDER_KEY, run, setup, type ConfigOverrides, type Env } from './helpers'
 
@@ -37,9 +37,34 @@ describe('LLM 模型', () => {
     expect(decision!.llmDurationMs).toBeGreaterThanOrEqual(0)
     const input = env.llm!.calls[0]!
     expect(input.klines).toHaveLength(48)
-    expect(input).toMatchObject({ position: null, blocked: { buy: null, sell: '空仓，没有可卖的币' }, cadence: '每根 1h K 线收盘后', limits: { maxOrderUsdt: '50.00', maxOrderPct: 50 } })
-    expect(decision!.llmPrompt!.user).toContain('可用 100 USDT')
+    expect(input).toMatchObject({ position: null, blocked: { buy: null, sell: '空仓，没有可卖的币' }, cadence: '每根 1h K 线收盘后', limits: { maxBuyUsdt: '50.00', maxOrderPct: 50 } })
+    expect(decision!.llmPrompt!.user).toContain('可用 100.00 USDT')
     expect(decision!.llmPrompt!.user).toContain('现在能否卖出：不可以（空仓，没有可卖的币）')
+  })
+
+  it('日线：发给 LLM 的 K 线覆盖不到 14 天时附上最近 14 根已收盘日线；覆盖得到、或没有 LLM 模型参赛时不取', async () => {
+    const day = 86_400_000
+    const today = Date.UTC(2026, 9, 8)
+    // 最后一根是今天、还没收盘
+    const daily = Array.from({ length: 21 }, (_, i) => ({ ...makeKlines([50000], today)[0]!, openTime: today - (20 - i) * day, closeTime: today - (19 - i) * day - 1 }))
+
+    const env = llmSetup([act('hold')])
+    env.market.intervalKlines['1d'] = daily
+    await run(env)
+    const input = env.llm!.calls[0]!
+    expect(input.dailyKlines).toHaveLength(14)
+    expect(input.dailyKlines.at(-1)!.openTime).toBe(today - day)
+    expect(env.store.getDecision('d-1')!.llmPrompt!.user).toContain('最近 14 根日线')
+
+    // 48 根 8h K 线覆盖 16 天
+    const long = llmSetup([act('hold')], { klineInterval: '8h' })
+    await run(long)
+    expect(long.llm!.calls[0]!.dailyKlines).toEqual([])
+
+    const baseline = setup()
+    const getKlines = vi.spyOn(baseline.market, 'getKlines')
+    await run(baseline)
+    expect(getKlines.mock.calls.map(c => c[1])).toEqual(['1h'])
   })
 
   it('观望：记录这次询问，不交易', async () => {
@@ -107,7 +132,6 @@ describe('LLM 模型', () => {
     expect(input.blocked).toMatchObject({ buy: expect.stringContaining('仓位上限'), sell: null })
     expect(input.recentDecisions).toMatchObject([{ action: 'buy', sizePct: 50, outcome: 'filled' }])
     expect(input.recentFills).toMatchObject([{ side: 'buy' }])
-    expect(Number.isFinite(input.indicators.smaFast)).toBe(true)
     expect(input.stats.hours).toBeGreaterThan(0)
     const after = { base: env.state().getLedger()!.base, cost: env.state().getPosition()!.cost }
     expect(after.base.lt(before.base)).toBe(true)

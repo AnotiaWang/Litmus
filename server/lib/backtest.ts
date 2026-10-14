@@ -14,7 +14,7 @@ import { DatabaseSync } from 'node:sqlite'
 import Decimal from 'decimal.js'
 import { z } from 'zod'
 import { BASELINE_COLOR } from '../../shared/agents'
-import { RISK_PRESET_LABELS, seasonConfigFieldsSchema, type SeasonConfig } from '../../shared/settings'
+import { INTERVAL_MS, RISK_PRESET_LABELS, seasonConfigFieldsSchema, type SeasonConfig } from '../../shared/settings'
 import { Store } from './db'
 import { Engine, KLINE_LIMIT } from './engine'
 import { equityOf } from './ledger'
@@ -22,20 +22,6 @@ import { redact } from './logger'
 import { BinanceMarket, MockMarket, type Kline, type SymbolRules } from './market'
 import { RISK_RULE_LABELS, type RiskRule } from './risk'
 import { BASELINE_PARAMS, closedKlines } from './strategy'
-
-const MINUTE = 60_000
-/** K 线周期对应的毫秒数 */
-export const INTERVAL_MS: Record<string, number> = {
-  '15m': 15 * MINUTE,
-  '30m': 30 * MINUTE,
-  '1h': 60 * MINUTE,
-  '2h': 120 * MINUTE,
-  '4h': 240 * MINUTE,
-  '6h': 360 * MINUTE,
-  '8h': 480 * MINUTE,
-  '12h': 720 * MINUTE,
-  '1d': 1440 * MINUTE
-}
 
 export interface BacktestTrade {
   time: string
@@ -246,7 +232,7 @@ export async function runBacktestCommand(config: SeasonConfig, days: number, pri
   try {
     const market = new BinanceMarket()
     const interval = config.klineInterval
-    const step = INTERVAL_MS[interval]!
+    const step = INTERVAL_MS[interval]
     const end = Date.now()
     // 多取 KLINE_LIMIT 根，作为第一轮计算指标用的历史
     const start = end - (Math.ceil(days * 86_400_000 / step) + KLINE_LIMIT + 1) * step

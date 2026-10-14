@@ -157,7 +157,7 @@ describe('模型', () => {
     const r = await testAgent(deps, env.llmAgentId!)
     expect(r).toMatchObject({ ok: true, action: 'hold', error: null })
     expect(r.calls).toHaveLength(1)
-    expect(env.llm!.calls[0]).toMatchObject({ position: null, ledger: { usdt: '100', base: '0' }, recentDecisions: [] })
+    expect(env.llm!.calls[0]).toMatchObject({ position: null, ledger: { usdt: '100.00', base: '0' }, recentDecisions: [] })
     expect(env.store.listDecisions({ seasonId: env.season.id, onlyActions: false, limit: 10, offset: 0 }).total).toBe(0)
     await expect(testAgent(deps, env.baselineId!)).rejects.toThrow('不需要测试')
   })

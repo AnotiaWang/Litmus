@@ -36,7 +36,7 @@ export interface StrategyParams {
   trailingStopPct: number
 }
 
-/** 均线基线的固定参数（止损来自赛季的风险设置）。指标也按这组周期算好发给 LLM 参考 */
+/** 均线基线的固定参数（止损来自赛季的风险设置） */
 export const BASELINE_PARAMS = {
   mode: 'trend',
   smaFast: 20,
@@ -98,6 +98,11 @@ export interface MarketStats {
   changePct: number
   high: number
   low: number
+  /** 比统计区间短的几个时段（1 / 4 / 12 小时）各自的涨跌幅 */
+  changes: Array<{ hours: number, pct: number }>
+  /** 最新收盘价相对统计区间最高价 / 最低价的涨跌幅（%） */
+  fromHighPct: number
+  fromLowPct: number
   /** 平均真实波幅（Wilder 平滑，14 根），数据不足时为 NaN */
   atr: number
   /** 最新一根成交量 ÷ 之前 20 根的平均成交量，数据不足时为 NaN */
@@ -162,8 +167,10 @@ export function indicatorsOf(closes: number[], params: Pick<StrategyParams, 'sma
   }
 }
 
-const DAY_MS = 24 * 60 * 60 * 1000
+const HOUR_MS = 60 * 60 * 1000
+const DAY_MS = 24 * HOUR_MS
 const VOLUME_BARS = 20
+const CHANGE_HOURS = [1, 4, 12]
 
 /** 根据已收盘 K 线（按时间先后）算行情摘要。 */
 export function marketStats(klines: Kline[]): MarketStats {
@@ -175,11 +182,22 @@ export function marketStats(klines: Kline[]): MarketStats {
   const open = Number(first.open)
   const prevVolumes = klines.slice(-VOLUME_BARS - 1, -1).map(k => Number(k.volume))
   const avgVolume = prevVolumes.reduce((a, b) => a + b, 0) / prevVolumes.length
+  const hours = (end - first.openTime) / HOUR_MS
+  const high = Math.max(...window.map(k => Number(k.high)))
+  const low = Math.min(...window.map(k => Number(k.low)))
+  // 找不到恰好从该时刻开盘的 K 线（周期比时段长、对不齐或数据不够）就不算这个时段
+  const changes = CHANGE_HOURS.filter(h => h < hours).flatMap((h) => {
+    const bar = klines.find(k => k.openTime === end - h * HOUR_MS)
+    return bar ? [{ hours: h, pct: (close - Number(bar.open)) / Number(bar.open) * 100 }] : []
+  })
   return {
-    hours: (end - first.openTime) / 3_600_000,
+    hours,
     changePct: (close - open) / open * 100,
-    high: Math.max(...window.map(k => Number(k.high))),
-    low: Math.min(...window.map(k => Number(k.low))),
+    high,
+    low,
+    changes,
+    fromHighPct: (close - high) / high * 100,
+    fromLowPct: (close - low) / low * 100,
     atr: atr(klines, 14),
     volumeRatio: prevVolumes.length === VOLUME_BARS && avgVolume > 0 ? Number(last.volume) / avgVolume : Number.NaN
   }
