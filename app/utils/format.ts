@@ -62,3 +62,26 @@ export function pnlClass(value: string | number | null | undefined): string {
   if (!Number.isFinite(n) || n === 0) return ''
   return n > 0 ? 'text-success' : 'text-error'
 }
+
+export function fmtDuration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '-'
+  return ms < 1000 ? `${Math.round(ms)} 毫秒` : `${(ms / 1000).toFixed(1)} 秒`
+}
+
+export const fmtTokens = (n: number | null | undefined) => typeof n === 'number' ? n.toLocaleString('zh-CN') : '-'
+
+/** 大数字用“万”简写，如 123,456 → 12.3 万 */
+export function fmtCompact(n: number): string {
+  return n >= 10_000 ? `${(n / 10_000).toLocaleString('zh-CN', { maximumFractionDigits: 1 })} 万` : n.toLocaleString('zh-CN')
+}
+
+/** a / b 的百分比文字；b 为 0 时为 '-' */
+export function fmtRatio(a: number, b: number): string {
+  return b > 0 ? `${Math.round(a / b * 100)}%` : '-'
+}
+
+/** LLM 作答的次数：询问次数去掉请求失败（服务的问题，不算模型的）。成功率的分母 */
+export const answered = (llm: { asked: number, requestFailed: number }) => llm.asked - llm.requestFailed
+
+/** 交易对的基础币，如 BTCUSDT → BTC */
+export const baseAssetOf = (symbol: string) => symbol.replace(/USDT$/, '')

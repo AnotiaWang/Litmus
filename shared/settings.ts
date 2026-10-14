@@ -1,19 +1,19 @@
 /**
- * 面板里可以调整的运行参数（预算、运行间隔、决策方式、策略、风控、LLM）。
+ * 前后端共用的设置校验：赛季配置和站点设置。面板表单提交前校验一次，服务端保存前再校验一次。
  *
- * 保存在数据库里，改了马上生效，不用重启；没保存过的项使用这里的默认值。
- * 前后端共用同一份校验：面板表单提交前校验一次，服务端保存前再校验一次。
+ * - 赛季配置：交易对、初始资金、决策周期、风险预设等所有影响交易结果的参数。赛季开始时定下，赛季内不能改，
+ *   要换参数就开新赛季——否则同一条资产曲线里混着两套规则，模型之间也没法比
+ * - 站点设置：是否公开浏览等，随时可以改，不影响交易
+ *
  * 金额以字符串保存（保留完整精度），表单里填数字也可以。
  */
 import { z } from 'zod'
 
-export const KLINE_INTERVALS = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'] as const
+/** 决策周期（K 线周期）。更短的周期每天要问几十上百次 LLM，成本太高，不提供 */
+export const KLINE_INTERVALS = ['15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d'] as const
+export type KlineInterval = typeof KLINE_INTERVALS[number]
 
-/** 策略取 100 根 K 线，长期均线最多 98 根（交叉判断还要用到前一根） */
-export const SMA_SLOW_MAX = 98
-/** 信号确认最多看几根 K 线 */
-export const CONFIRM_BARS_MAX = 10
-/** LLM 决策模式最多发给 LLM 多少根 K 线（引擎每轮取 100 根） */
+/** 发给 LLM 的 K 线最多多少根（引擎每轮取 100 根） */
 export const LLM_KLINES_MAX = 100
 
 const int = (fallback: number, min: number, max: number) =>
@@ -26,79 +26,74 @@ const money = (fallback: string) =>
     '必须是大于 0 的数字'
   )
 
-export const settingsSchema = z.object({
-  /** 策略起始资金（USDT）。修改后策略账本会在下一轮重新开始 */
-  budgetUsdt: money('100'),
-  /** 每隔多少分钟运行一轮，按整点对齐 */
-  intervalMinutes: int(15, 1, 1440),
-  /** rules：均线 + RSI 规则产生信号（可选 LLM 复核买入）；llm：LLM 直接决定买卖。两种模式都由代码执行止损和风控 */
-  decisionMode: z.enum(['rules', 'llm']).default('rules'),
-  /** 规则模式：是否用 LLM 复核买入（还需要在 .env 里配置 LLM 连接信息） */
-  llmEnabled: z.boolean().default(true),
-
-  /** LLM 决策模式多久问一次 LLM：candle 每根 K 线收盘后一次；interval 每 llmIntervalMinutes 分钟一次。其余轮次只检查止损 */
-  llmCadence: z.enum(['candle', 'interval']).default('candle'),
-  /** llmCadence 为 interval 时的间隔（分钟），按整点对齐 */
-  llmIntervalMinutes: int(60, 1, 1440),
-  /** LLM 决策模式发给 LLM 的已收盘 K 线根数 */
-  llmKlines: int(48, 10, LLM_KLINES_MAX),
-
-  klineInterval: z.enum(KLINE_INTERVALS).default('1h'),
-  /** trend：按均线所处状态（短期在长期上方 / 下方）；cross：只在均线交叉的那根 K 线上 */
-  signalMode: z.enum(['trend', 'cross']).default('trend'),
-  /** trend 模式：短期均线要连续这么多根已收盘 K 线都在长期均线上方 / 下方才买 / 卖，1 为不确认 */
-  confirmBars: int(2, 1, CONFIRM_BARS_MAX),
-  smaFast: int(20, 2, SMA_SLOW_MAX - 1),
-  smaSlow: int(50, 3, SMA_SLOW_MAX),
-  rsiPeriod: int(14, 2, 50),
-  rsiBuyMax: num(70, 1, 100),
-  /** 持仓时 RSI 高于此值止盈卖出；100 为关闭（RSI 不会超过 100） */
-  rsiSellMin: num(100, 1, 100),
-  /** 止损：价格比持仓均价低这么多 % 时卖出，0 为关闭 */
-  stopLossPct: num(5, 0, 99),
-  /** 移动止损：价格比持仓以来最高价低这么多 % 时卖出，0 为关闭 */
+/** 风控参数：程序在模型的决定之上执行的限制，只会调小金额或拦下交易 */
+export const riskSchema = z.object({
+  /** 止损：价格比持仓均价低这么多 % 时全部卖出，0 为关闭 */
+  stopLossPct: num(0, 0, 99),
+  /** 移动止损：价格比持仓以来最高价低这么多 % 时全部卖出，0 为关闭 */
   trailingStopPct: num(0, 0, 99),
-
-  maxOrderUsdt: money('50'),
-  maxPositionPct: num(50, 1, 100),
-  maxTradesPerDay: int(6, 1, 1000),
-  cooldownMinutes: int(60, 0, 10080),
-  dailyLossLimitPct: num(5, 0.01, 100)
-}).superRefine((v, ctx) => {
-  if (v.smaFast >= v.smaSlow) {
-    ctx.addIssue({ code: 'custom', path: ['smaFast'], message: '必须小于长期均线' })
-  }
-  // 往前数 confirmBars 根时，每根都要有足够的 K 线算长期均线（策略共取 SMA_SLOW_MAX + 2 = 100 根）
-  if (v.smaSlow + v.confirmBars > SMA_SLOW_MAX + 2) {
-    ctx.addIssue({ code: 'custom', path: ['confirmBars'], message: `长期均线 + 确认根数不能超过 ${SMA_SLOW_MAX + 2}` })
-  }
+  /** 单笔买入最多动用总资产的百分之几 */
+  maxOrderPct: num(100, 1, 100),
+  /** 持币市值最多占总资产的百分之几 */
+  maxPositionPct: num(100, 1, 100),
+  /** 每天（UTC）最多成交几笔（买卖都算）；达到后当天不再买入，卖出不受限 */
+  maxTradesPerDay: int(12, 1, 1000),
+  /** 上一笔成交后至少间隔多少分钟才能再买入 */
+  cooldownMinutes: int(0, 0, 10080),
+  /** 当日亏损达到这么多 % 时，当天不再买入（卖出照常） */
+  dailyLossLimitPct: num(15, 0.01, 100)
 })
-
-export type Settings = z.output<typeof settingsSchema>
-
-export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({})
+export type RiskParams = z.output<typeof riskSchema>
 
 /**
- * 这些参数以前用环境变量配置。现在只有回测命令还认它们（临时换参数试试，不影响面板里的设置），
- * 正式服务启动时如果发现 .env 里还有，会提示已经不生效。
+ * 风险预设。护栏越紧，各模型的结果越接近——管得越多，测出来的越是程序的风控而不是模型的判断，
+ * 所以默认用最宽松的“激进”。
  */
-export const LEGACY_ENV_KEYS = {
-  BUDGET_USDT: 'budgetUsdt',
-  INTERVAL_MINUTES: 'intervalMinutes',
-  LLM_ENABLED: 'llmEnabled',
-  KLINE_INTERVAL: 'klineInterval',
-  SIGNAL_MODE: 'signalMode',
-  CONFIRM_BARS: 'confirmBars',
-  SMA_FAST: 'smaFast',
-  SMA_SLOW: 'smaSlow',
-  RSI_PERIOD: 'rsiPeriod',
-  RSI_BUY_MAX: 'rsiBuyMax',
-  RSI_SELL_MIN: 'rsiSellMin',
-  STOP_LOSS_PCT: 'stopLossPct',
-  TRAILING_STOP_PCT: 'trailingStopPct',
-  MAX_ORDER_USDT: 'maxOrderUsdt',
-  MAX_POSITION_PCT: 'maxPositionPct',
-  MAX_TRADES_PER_DAY: 'maxTradesPerDay',
-  COOLDOWN_MINUTES: 'cooldownMinutes',
-  DAILY_LOSS_LIMIT_PCT: 'dailyLossLimitPct'
-} as const satisfies Record<string, keyof Settings>
+export const RISK_PRESETS = {
+  conservative: { stopLossPct: 3, trailingStopPct: 5, maxOrderPct: 25, maxPositionPct: 50, maxTradesPerDay: 4, cooldownMinutes: 120, dailyLossLimitPct: 3 },
+  moderate: { stopLossPct: 5, trailingStopPct: 0, maxOrderPct: 50, maxPositionPct: 80, maxTradesPerDay: 6, cooldownMinutes: 60, dailyLossLimitPct: 5 },
+  aggressive: { stopLossPct: 10, trailingStopPct: 0, maxOrderPct: 100, maxPositionPct: 100, maxTradesPerDay: 12, cooldownMinutes: 0, dailyLossLimitPct: 15 }
+} as const satisfies Record<string, RiskParams>
+
+export type RiskPreset = keyof typeof RISK_PRESETS | 'custom'
+
+export const RISK_PRESET_LABELS: Record<RiskPreset, string> = {
+  conservative: '保守',
+  moderate: '温和',
+  aggressive: '激进',
+  custom: '自定义'
+}
+
+/**
+ * 赛季配置的字段。保存下来的配置用这个读取（不套用预设），赛季开始后预设的定义改了也不会影响已有赛季；
+ * 新建赛季时用下面的 seasonConfigSchema，把预设展开成具体数值再保存。
+ */
+export const seasonConfigFieldsSchema = z.object({
+  /** 交易对，只支持以 USDT 计价的现货 */
+  symbol: z.string().trim().toUpperCase().regex(/^[A-Z0-9]{2,15}USDT$/, '交易对格式不对，只支持以 USDT 计价的现货，例如 BTCUSDT').default('BTCUSDT'),
+  /** 每个模型的初始资金（USDT），所有模型相同 */
+  initialCapital: money('1500'),
+  /** 决策周期：每根这个周期的 K 线收盘后问一次 LLM */
+  klineInterval: z.enum(KLINE_INTERVALS).default('1h'),
+  /** 每隔多少分钟运行一轮（按整点对齐）。两次询问 LLM 之间的轮次只检查止损、记录资产 */
+  checkIntervalMinutes: int(15, 1, 1440),
+  /** 发给 LLM 的已收盘 K 线根数 */
+  llmKlines: int(48, 10, LLM_KLINES_MAX),
+  riskPreset: z.enum(['conservative', 'moderate', 'aggressive', 'custom']).default('aggressive'),
+  /** riskPreset 为 custom 时使用；其他预设会被替换成预设的值 */
+  risk: riskSchema.default(RISK_PRESETS.aggressive)
+})
+
+export const seasonConfigSchema = seasonConfigFieldsSchema.transform(v => v.riskPreset === 'custom' ? v : { ...v, risk: { ...RISK_PRESETS[v.riskPreset] } })
+
+export type SeasonConfig = z.output<typeof seasonConfigSchema>
+
+export const DEFAULT_SEASON_CONFIG: SeasonConfig = seasonConfigSchema.parse({})
+
+/** 站点设置：随时可以改，不影响交易 */
+export const appSettingsSchema = z.object({
+  /** 开启后任何人都能浏览排行榜、曲线和决策记录；管理操作始终需要口令 */
+  publicRead: z.boolean().default(true)
+})
+
+export type AppSettings = z.output<typeof appSettingsSchema>

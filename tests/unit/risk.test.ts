@@ -1,8 +1,8 @@
 import Decimal from 'decimal.js'
 import { describe, expect, it } from 'vitest'
-import type { SymbolRules } from '../../server/lib/exchange'
-import { evaluateRisk, precheck, type RiskInput } from '../../server/lib/risk'
-import { testConfig } from './helpers'
+import type { SymbolRules } from '../../server/lib/market'
+import { evaluateRisk, maxOrderUsdt, precheck, type RiskInput } from '../../server/lib/risk'
+import { FIXTURE_RISK } from './helpers'
 
 const rules: SymbolRules = {
   symbol: 'BTCUSDT',
@@ -20,9 +20,8 @@ function input(overrides: Partial<RiskInput> = {}): RiskInput {
     sizePct: 100,
     price: new Decimal(50000),
     ledger: { usdt: new Decimal(100), base: new Decimal(0) },
-    sellableBase: new Decimal(0),
     rules,
-    limits: testConfig().risk,
+    limits: FIXTURE_RISK,
     tradesToday: 0,
     lastTradeAt: null,
     now,
@@ -36,9 +35,16 @@ describe('风控 · 买入', () => {
   it('最终金额 = min(LLM 建议, 单笔上限, 账本可用)', () => {
     expect(evaluateRisk(input({ sizePct: 30 })).quoteAmount!.toFixed()).toBe('30')
     const capped = evaluateRisk(input({ sizePct: 100 }))
-    // 100 → 单笔上限 50
+    // 100 → 单笔上限：总资产 100 的 50%
     expect(capped.quoteAmount!.toFixed()).toBe('50')
-    expect(capped.reason).toContain('单笔上限')
+    expect(capped.reason).toContain('单笔上限（总资产的 50%）')
+  })
+
+  it('单笔上限按总资产（现金 + 持币市值）的百分比计算', () => {
+    const limits = { ...FIXTURE_RISK, maxOrderPct: 20, maxPositionPct: 100 }
+    // 现金 60 + 持币 0.0008 × 50000 = 40，总资产 100 → 单笔最多 20
+    expect(maxOrderUsdt({ ledger: { usdt: new Decimal(60), base: new Decimal('0.0008') }, price: new Decimal(50000), limits }).toFixed()).toBe('20')
+    expect(evaluateRisk(input({ limits, ledger: { usdt: new Decimal(60), base: new Decimal('0.0008') } })).quoteAmount!.toFixed()).toBe('20')
   })
 
   it('仓位上限：买入后持币市值不超过总资产的 50%，超出部分调小', () => {
@@ -67,7 +73,7 @@ describe('风控 · 买入', () => {
 })
 
 describe('风控 · 卖出', () => {
-  const holding = { ledger: { usdt: new Decimal(50), base: new Decimal('0.00123') }, sellableBase: new Decimal('0.00123'), side: 'sell' as const }
+  const holding = { ledger: { usdt: new Decimal(50), base: new Decimal('0.00123') }, side: 'sell' as const }
 
   it('卖出数量按比例并按步长向下取整', () => {
     const r = evaluateRisk(input({ ...holding, sizePct: 50 }))
@@ -76,11 +82,6 @@ describe('风控 · 卖出', () => {
 
   it('只卖已有持仓', () => {
     expect(evaluateRisk(input({ side: 'sell' }))).toMatchObject({ passed: false, rule: 'no_position' })
-  })
-
-  it('卖出数量不超过账户真实可用余额', () => {
-    const r = evaluateRisk(input({ ...holding, sellableBase: new Decimal('0.001') }))
-    expect(r.quantity!.toFixed()).toBe('0.001')
   })
 
   it('部分卖出后剩下的不够最小下单额时，改为全部卖出', () => {
@@ -112,9 +113,15 @@ describe('风控 · 通用规则', () => {
     expect(evaluateRisk(input({ equity: new Decimal('95.01') })).passed).toBe(true)
   })
 
+  it('熔断中（到下一个 UTC 0 点）：即使资产已经回升也不买入', () => {
+    const r = evaluateRisk(input({ circuit: '今日已亏损 6.00%（上限 5%）' }))
+    expect(r).toMatchObject({ passed: false, rule: 'daily_loss' })
+    expect(r.reason).toBe('当日亏损熔断：今日已亏损 6.00%（上限 5%）')
+  })
+
   it('卖出不受熔断、每日次数、冷却时间约束', () => {
-    const sell = { side: 'sell' as const, ledger: { usdt: new Decimal(50), base: new Decimal('0.001') }, sellableBase: new Decimal('0.001') }
-    const r = evaluateRisk(input({ ...sell, equity: new Decimal(90), tradesToday: 99, lastTradeAt: new Date(now.getTime() - 60_000) }))
+    const sell = { side: 'sell' as const, ledger: { usdt: new Decimal(50), base: new Decimal('0.001') } }
+    const r = evaluateRisk(input({ ...sell, equity: new Decimal(90), circuit: '熔断中', tradesToday: 99, lastTradeAt: new Date(now.getTime() - 60_000) }))
     expect(r.passed).toBe(true)
     expect(r.quantity!.toFixed()).toBe('0.001')
   })

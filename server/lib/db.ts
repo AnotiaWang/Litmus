@@ -4,114 +4,112 @@
  * 用 Node 内置的 node:sqlite（同步 API），不需要编译原生模块；开启 WAL，读写互不阻塞。
  * 金额、数量一律以字符串（TEXT）存储，读出后再交给 decimal.js，避免浮点误差。
  *
- * 三张表：
- * - decisions：每轮决策一条，观望、被否决、被拦截、出错的轮次都记录
- * - equity_snapshots：每轮一条资产快照，用来画资产曲线
- * - state：键值对，保存暂停状态、策略账本、持仓成本、初始预算和价格、UTC 0 点资产、面板里的设置、LLM 上次询问的时段等
+ * 表：
+ * - providers / agents：OpenAI 兼容接口和挂在上面的参赛模型（还有一个不调用 LLM 的均线基线）
+ * - seasons：赛季，config 是赛季开始时定下的全部交易参数，赛季内不变
+ * - entries：某个模型在某个赛季的参赛记录（加入、归档时间）；entry_state 是它的运行状态（账本、持仓等）
+ * - ticks：每轮一条行情快照，所有模型共用同一份价格
+ * - equity：每轮每个模型的资产，用来画曲线、算回撤
+ * - decisions：决策记录，只在问过 LLM、触发止损、规则给出买卖信号或出错时写
+ * - meta：站点设置、全局暂停等键值对
  */
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, renameSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import Decimal from 'decimal.js'
-import { settingsSchema, type Settings } from '../../shared/settings'
-import type { Decision, Outcome } from '../../shared/types/api'
+import type { AgentInput, AgentUpdate, ProviderInput } from '../../shared/agents'
+import { appSettingsSchema, seasonConfigFieldsSchema, type AppSettings, type SeasonConfig } from '../../shared/settings'
+import type { AgentKind, Decision, Outcome } from '../../shared/types/api'
+import type { Ledger, Position } from './ledger'
 
 export type { Decision, Outcome }
 
-export interface Snapshot {
-  createdAt: string
-  decisionId: string | null
-  price: string
-  usdt: string
-  base: string
-  total: string
-  benchmark: string
-}
-
-export interface Ledger {
-  usdt: Decimal
-  base: Decimal
-}
-
-/** 当前持仓的成本信息，用于计算止损线。空仓时不存在。 */
-export interface Position {
-  /** 这笔持仓花了多少 USDT（含手续费）；部分卖出时按比例减少。持仓均价 = cost ÷ 账本持币 */
-  cost: Decimal
-  /** 持仓以来的最高价（移动止损用） */
-  peak: Decimal
-}
-
-/** 止损 / 止盈卖出后锁定再次买入，直到短期均线回到长期均线下方 */
-export interface ReentryLock {
-  since: string
-  reason: string
-}
-
-export interface PauseState {
-  paused: boolean
-  reason: string | null
-  /** 'manual' 手动暂停；'daily_loss' 亏损熔断（到 until 自动恢复）；'reconcile' 账本核对失败 */
-  source: 'manual' | 'daily_loss' | 'reconcile' | null
-  /** 自动恢复时间（ISO），只有熔断时有 */
-  until: string | null
-  since: string | null
-}
-
-export interface InitialState {
-  budget: string
-  price: string
-  at: string
-}
-
-export interface DayStart {
-  /** UTC 日期 YYYY-MM-DD */
-  date: string
-  equity: string
-}
-
-// Decision 字段 ↔ 数据库列
-const COLUMNS = {
-  id: 'id',
-  createdAt: 'created_at',
-  trigger: 'trigger',
-  symbol: 'symbol',
-  mode: 'mode',
-  price: 'price',
-  indicators: 'indicators',
-  signal: 'signal',
-  signalNote: 'signal_note',
-  llmDecision: 'llm_decision',
-  llmSizePct: 'llm_size_pct',
-  llmConfidence: 'llm_confidence',
-  llmReason: 'llm_reason',
-  llmRaw: 'llm_raw',
-  llmCalls: 'llm_calls',
-  llmPrompt: 'llm_prompt',
-  riskPassed: 'risk_passed',
-  riskRule: 'risk_rule',
-  riskReason: 'risk_reason',
-  orderSide: 'order_side',
-  orderQuoteAmount: 'order_quote_amount',
-  orderQty: 'order_qty',
-  orderId: 'order_id',
-  orderStatus: 'order_status',
-  filledQty: 'filled_qty',
-  filledQuote: 'filled_quote',
-  commission: 'commission',
-  outcome: 'outcome',
-  error: 'error'
-} as const satisfies Record<keyof Decision, string>
+const SCHEMA_VERSION = 2
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS providers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  api_key TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  color TEXT NOT NULL,
+  provider_id INTEGER REFERENCES providers(id),
+  model TEXT,
+  reasoning_effort TEXT,
+  timeout_seconds INTEGER,
+  extra_params TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL,
+  archived_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS seasons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  config TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS entries (
+  season_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  joined_at TEXT NOT NULL,
+  left_at TEXT,
+  PRIMARY KEY (season_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS entry_state (
+  season_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  PRIMARY KEY (season_id, agent_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS ticks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  season_id INTEGER NOT NULL,
+  at TEXT NOT NULL,
+  trigger TEXT NOT NULL,
+  price TEXT,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ticks_season ON ticks(season_id, at);
+
+CREATE TABLE IF NOT EXISTS equity (
+  tick_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  usdt TEXT NOT NULL,
+  base TEXT NOT NULL,
+  total TEXT NOT NULL,
+  PRIMARY KEY (tick_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_equity_agent ON equity(agent_id, tick_id);
+
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY,
+  season_id INTEGER NOT NULL,
+  agent_id INTEGER NOT NULL,
+  tick_id INTEGER NOT NULL,
   created_at TEXT NOT NULL,
-  trigger TEXT NOT NULL,
-  symbol TEXT NOT NULL,
-  price TEXT,
+  price TEXT NOT NULL,
   indicators TEXT,
   signal TEXT,
   signal_note TEXT,
+  llm_status TEXT,
   llm_decision TEXT,
   llm_size_pct REAL,
   llm_confidence REAL,
@@ -119,48 +117,61 @@ CREATE TABLE IF NOT EXISTS decisions (
   llm_raw TEXT,
   llm_calls TEXT,
   llm_prompt TEXT,
+  llm_duration_ms INTEGER,
+  llm_prompt_tokens INTEGER,
+  llm_completion_tokens INTEGER,
   risk_passed INTEGER,
   risk_rule TEXT,
   risk_reason TEXT,
   order_side TEXT,
   order_quote_amount TEXT,
   order_qty TEXT,
-  order_id TEXT,
-  order_status TEXT,
   filled_qty TEXT,
   filled_quote TEXT,
-  commission TEXT,
+  fee_usdt TEXT,
+  realized_pnl TEXT,
   outcome TEXT NOT NULL,
-  error TEXT,
-  mode TEXT
+  error TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_decisions_created_at ON decisions(created_at);
-CREATE INDEX IF NOT EXISTS idx_decisions_outcome ON decisions(outcome, created_at);
-
-CREATE TABLE IF NOT EXISTS equity_snapshots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT NOT NULL,
-  decision_id TEXT,
-  price TEXT NOT NULL,
-  usdt TEXT NOT NULL,
-  base TEXT NOT NULL,
-  total TEXT NOT NULL,
-  benchmark TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_snapshots_created_at ON equity_snapshots(created_at);
-
-CREATE TABLE IF NOT EXISTS state (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL
-);
+CREATE INDEX IF NOT EXISTS idx_decisions_agent ON decisions(season_id, agent_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(season_id, created_at);
 `
 
-/** 旧版本建的库没有这些后来加的列，启动时补上。ADD COLUMN 不会动已有数据，旧记录的新列为 NULL */
-const ADDED_COLUMNS: Array<[column: string, type: string]> = [
-  ['llm_calls', 'TEXT'],
-  ['llm_prompt', 'TEXT'],
-  ['mode', 'TEXT']
-]
+// Decision 字段 ↔ 数据库列
+const COLUMNS = {
+  id: 'id',
+  seasonId: 'season_id',
+  agentId: 'agent_id',
+  tickId: 'tick_id',
+  createdAt: 'created_at',
+  price: 'price',
+  indicators: 'indicators',
+  signal: 'signal',
+  signalNote: 'signal_note',
+  llmStatus: 'llm_status',
+  llmDecision: 'llm_decision',
+  llmSizePct: 'llm_size_pct',
+  llmConfidence: 'llm_confidence',
+  llmReason: 'llm_reason',
+  llmRaw: 'llm_raw',
+  llmCalls: 'llm_calls',
+  llmPrompt: 'llm_prompt',
+  llmDurationMs: 'llm_duration_ms',
+  llmPromptTokens: 'llm_prompt_tokens',
+  llmCompletionTokens: 'llm_completion_tokens',
+  riskPassed: 'risk_passed',
+  riskRule: 'risk_rule',
+  riskReason: 'risk_reason',
+  orderSide: 'order_side',
+  orderQuoteAmount: 'order_quote_amount',
+  orderQty: 'order_qty',
+  filledQty: 'filled_qty',
+  filledQuote: 'filled_quote',
+  feeUsdt: 'fee_usdt',
+  realizedPnl: 'realized_pnl',
+  outcome: 'outcome',
+  error: 'error'
+} as const satisfies Record<keyof Decision, string>
 
 /** 以 JSON 文本存储的字段 */
 const JSON_FIELDS: Array<keyof Decision> = ['indicators', 'llmCalls', 'llmPrompt']
@@ -175,11 +186,10 @@ function toDecision(row: Row): Decision {
   return d as unknown as Decision
 }
 
-function toRow(patch: Partial<Decision>): Row {
+function toRow(d: Decision): Row {
   const row: Row = {}
-  for (const [field, value] of Object.entries(patch)) {
-    const col = COLUMNS[field as keyof Decision]
-    if (!col) continue
+  for (const [field, col] of Object.entries(COLUMNS)) {
+    const value = d[field as keyof Decision]
     if (JSON_FIELDS.includes(field as keyof Decision)) row[col] = value === null || value === undefined ? null : JSON.stringify(value)
     else if (field === 'riskPassed') row[col] = value === null ? null : value ? 1 : 0
     else row[col] = (value ?? null) as SQLInputValue
@@ -187,22 +197,239 @@ function toRow(patch: Partial<Decision>): Row {
   return row
 }
 
-type SnapshotRow = Record<'created_at' | 'decision_id' | 'price' | 'usdt' | 'base' | 'total' | 'benchmark', string | null>
+export interface ProviderRow {
+  id: number
+  name: string
+  baseUrl: string
+  apiKey: string
+  createdAt: string
+}
 
-function toSnapshot(r: SnapshotRow): Snapshot {
+export interface AgentRow {
+  id: number
+  kind: AgentKind
+  name: string
+  color: string
+  providerId: number | null
+  model: string | null
+  reasoningEffort: string | null
+  timeoutSeconds: number | null
+  extraParams: Record<string, unknown> | null
+  status: 'active' | 'archived'
+  createdAt: string
+  archivedAt: string | null
+}
+
+export interface SeasonRow {
+  id: number
+  name: string
+  config: SeasonConfig
+  startedAt: string
+  endedAt: string | null
+}
+
+export interface EntryRow {
+  seasonId: number
+  agentId: number
+  joinedAt: string
+  leftAt: string | null
+}
+
+export interface TickRow {
+  id: number
+  seasonId: number
+  at: string
+  trigger: 'schedule' | 'manual'
+  price: string | null
+  error: string | null
+}
+
+/** 账本初始化时记下的起点：用于算收益率和“一直持有”的基准 */
+export interface InitialState {
+  capital: string
+  price: string
+  at: string
+}
+
+export interface DayStart {
+  /** UTC 日期 YYYY-MM-DD */
+  date: string
+  equity: string
+}
+
+/** 当日亏损熔断：到 until（下一个 UTC 0 点）之前不买入，卖出照常 */
+export interface Circuit {
+  reason: string
+  until: string
+}
+
+/** 止损 / 止盈卖出后锁定再次买入，直到短期均线回到长期均线下方（均线基线用） */
+export interface ReentryLock {
+  since: string
+  reason: string
+}
+
+/** 全局手动暂停：所有模型都不询问 LLM、不交易，资产照常记录 */
+export interface PauseState {
+  paused: boolean
+  since: string | null
+}
+
+/** 每个模型在一个赛季里的成交和 LLM 统计 */
+export interface EntryStats {
+  agentId: number
+  trades: number
+  sells: number
+  wins: number
+  fees: number
+  llmAsked: number
+  llmOk: number
+  llmInvalid: number
+  llmFailed: number
+  llmAvgDurationMs: number | null
+  llmPromptTokens: number
+  llmCompletionTokens: number
+}
+
+const str = (v: SQLInputValue | undefined) => v === null || v === undefined ? null : String(v)
+
+function toAgent(r: Row): AgentRow {
   return {
-    createdAt: r.created_at!,
-    decisionId: r.decision_id,
-    price: r.price!,
-    usdt: r.usdt!,
-    base: r.base!,
-    total: r.total!,
-    benchmark: r.benchmark!
+    id: Number(r.id),
+    kind: r.kind as AgentKind,
+    name: String(r.name),
+    color: String(r.color),
+    providerId: r.provider_id === null ? null : Number(r.provider_id),
+    model: str(r.model),
+    reasoningEffort: str(r.reasoning_effort),
+    timeoutSeconds: r.timeout_seconds === null ? null : Number(r.timeout_seconds),
+    extraParams: r.extra_params ? JSON.parse(String(r.extra_params)) : null,
+    status: r.status as AgentRow['status'],
+    createdAt: String(r.created_at),
+    archivedAt: str(r.archived_at)
   }
 }
 
-/** 有交易意图的结果（用于“只看买卖信号”） */
-const ACTION_SIGNALS = `signal IN ('buy', 'sell')`
+function toSeason(r: Row): SeasonRow {
+  return {
+    id: Number(r.id),
+    name: String(r.name),
+    config: seasonConfigFieldsSchema.parse(JSON.parse(String(r.config))),
+    startedAt: String(r.started_at),
+    endedAt: str(r.ended_at)
+  }
+}
+
+const toEntry = (r: Row): EntryRow => ({ seasonId: Number(r.season_id), agentId: Number(r.agent_id), joinedAt: String(r.joined_at), leftAt: str(r.left_at) })
+
+const toTick = (r: Row): TickRow => ({ id: Number(r.id), seasonId: Number(r.season_id), at: String(r.at), trigger: r.trigger as TickRow['trigger'], price: str(r.price), error: str(r.error) })
+
+/**
+ * 上一个版本（单模型、Demo 下单）的数据库和现在的结构不兼容：发现时改名备份，返回备份路径；不是旧库时返回 null。
+ * 打开再关闭一次，让 WAL 里的内容合并回主文件，改名后备份是完整的。
+ */
+export function archiveLegacyDatabase(path: string, now = new Date()): string | null {
+  if (!existsSync(path)) return null
+  const db = new DatabaseSync(path)
+  let legacy: boolean
+  try {
+    const columns = (db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map(c => c.name)
+    legacy = columns.length > 0 && !columns.includes('season_id')
+  } finally {
+    db.close()
+  }
+  if (!legacy) return null
+  const backup = path.replace(/\.db$/, '') + `.v1-${now.toISOString().replace(/[-:]/g, '').slice(0, 15)}.db`
+  renameSync(path, backup)
+  return backup
+}
+
+/** 某个模型在某个赛季里的运行状态（账本、持仓、熔断等），存在 entry_state 表里 */
+export class EntryState {
+  constructor(private readonly db: DatabaseSync, readonly seasonId: number, readonly agentId: number) {}
+
+  private get<T>(key: string): T | null {
+    const row = this.db.prepare('SELECT value FROM entry_state WHERE season_id = ? AND agent_id = ? AND key = ?').get(this.seasonId, this.agentId, key) as { value: string } | undefined
+    return row ? JSON.parse(row.value) as T : null
+  }
+
+  private set(key: string, value: unknown): void {
+    if (value === null) {
+      this.db.prepare('DELETE FROM entry_state WHERE season_id = ? AND agent_id = ? AND key = ?').run(this.seasonId, this.agentId, key)
+      return
+    }
+    this.db.prepare('INSERT INTO entry_state (season_id, agent_id, key, value) VALUES (?, ?, ?, ?) ON CONFLICT(season_id, agent_id, key) DO UPDATE SET value = excluded.value')
+      .run(this.seasonId, this.agentId, key, JSON.stringify(value))
+  }
+
+  getLedger(): Ledger | null {
+    const v = this.get<{ usdt: string, base: string }>('ledger')
+    return v ? { usdt: new Decimal(v.usdt), base: new Decimal(v.base) } : null
+  }
+
+  setLedger(l: Ledger): void {
+    this.set('ledger', { usdt: l.usdt.toFixed(), base: l.base.toFixed() })
+  }
+
+  getPosition(): Position | null {
+    const v = this.get<{ cost: string, peak: string }>('position')
+    return v ? { cost: new Decimal(v.cost), peak: new Decimal(v.peak) } : null
+  }
+
+  setPosition(p: Position | null): void {
+    this.set('position', p && { cost: p.cost.toFixed(), peak: p.peak.toFixed() })
+  }
+
+  getInitial(): InitialState | null {
+    return this.get<InitialState>('initial')
+  }
+
+  setInitial(v: InitialState): void {
+    this.set('initial', v)
+  }
+
+  getDayStart(): DayStart | null {
+    return this.get<DayStart>('day_start')
+  }
+
+  setDayStart(v: DayStart): void {
+    this.set('day_start', v)
+  }
+
+  getCircuit(): Circuit | null {
+    return this.get<Circuit>('circuit')
+  }
+
+  setCircuit(v: Circuit | null): void {
+    this.set('circuit', v)
+  }
+
+  getReentryLock(): ReentryLock | null {
+    return this.get<ReentryLock>('reentry_lock')
+  }
+
+  setReentryLock(v: ReentryLock | null): void {
+    this.set('reentry_lock', v)
+  }
+
+  /** 最近一次处理过的规则信号所在 K 线（开盘时间）和方向（均线基线用） */
+  getHandledSignal(): { candle: number, signal: 'buy' | 'sell' } | null {
+    return this.get('handled_signal')
+  }
+
+  setHandledSignal(v: { candle: number, signal: 'buy' | 'sell' }): void {
+    this.set('handled_signal', v)
+  }
+
+  /** 最近一次问过 LLM 的时段（如 candle:1h:1760000000000），同一时段只问一次 */
+  getLlmSlot(): string | null {
+    return this.get<string>('llm_slot')
+  }
+
+  setLlmSlot(v: string): void {
+    this.set('llm_slot', v)
+  }
+}
 
 export class Store {
   readonly db: DatabaseSync
@@ -212,21 +439,7 @@ export class Store {
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;')
     this.db.exec(SCHEMA)
-    this.addMissingColumns()
-    this.migrateSettings()
-  }
-
-  /** 预算以前来自环境变量：旧库里账本已经按当时的预算初始化、但还没有保存过设置，就把那笔预算写进设置，面板上看到的才和账本一致 */
-  private migrateSettings(): void {
-    const initial = this.getInitial()
-    if (initial && this.getState('settings') === null) this.setSettings(settingsSchema.parse({ budgetUsdt: initial.budget }))
-  }
-
-  private addMissingColumns(): void {
-    const existing = new Set((this.db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map(c => c.name))
-    for (const [column, type] of ADDED_COLUMNS) {
-      if (!existing.has(column)) this.db.exec(`ALTER TABLE decisions ADD COLUMN ${column} ${type}`)
-    }
+    if (this.getMeta('schema_version') === null) this.setMeta('schema_version', SCHEMA_VERSION)
   }
 
   close(): void {
@@ -246,22 +459,243 @@ export class Store {
     }
   }
 
+  // ---------- meta ----------
+
+  private getMeta<T>(key: string): T | null {
+    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined
+    return row ? JSON.parse(row.value) as T : null
+  }
+
+  private setMeta(key: string, value: unknown): void {
+    this.db.prepare('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+      .run(key, JSON.stringify(value))
+  }
+
+  getAppSettings(): AppSettings {
+    return appSettingsSchema.parse(this.getMeta('app_settings') ?? {})
+  }
+
+  setAppSettings(s: AppSettings): void {
+    this.setMeta('app_settings', s)
+  }
+
+  getPause(): PauseState {
+    return this.getMeta<PauseState>('pause') ?? { paused: false, since: null }
+  }
+
+  setPause(p: PauseState): void {
+    this.setMeta('pause', p)
+  }
+
+  // ---------- providers ----------
+
+  listProviders(): ProviderRow[] {
+    const rows = this.db.prepare('SELECT * FROM providers ORDER BY id').all() as Row[]
+    return rows.map(r => ({ id: Number(r.id), name: String(r.name), baseUrl: String(r.base_url), apiKey: String(r.api_key), createdAt: String(r.created_at) }))
+  }
+
+  getProvider(id: number): ProviderRow | null {
+    return this.listProviders().find(p => p.id === id) ?? null
+  }
+
+  insertProvider(p: ProviderInput, now: Date): number {
+    const r = this.db.prepare('INSERT INTO providers (name, base_url, api_key, created_at) VALUES (?, ?, ?, ?)').run(p.name, p.baseUrl, p.apiKey, now.toISOString())
+    return Number(r.lastInsertRowid)
+  }
+
+  /** apiKey 为 undefined 时不改 */
+  updateProvider(id: number, p: { name: string, baseUrl: string, apiKey?: string }): void {
+    this.db.prepare('UPDATE providers SET name = ?, base_url = ?, api_key = COALESCE(?, api_key) WHERE id = ?').run(p.name, p.baseUrl, p.apiKey ?? null, id)
+  }
+
+  deleteProvider(id: number): void {
+    this.db.prepare('DELETE FROM providers WHERE id = ?').run(id)
+  }
+
+  // ---------- agents ----------
+
+  listAgents(): AgentRow[] {
+    return (this.db.prepare('SELECT * FROM agents ORDER BY id').all() as Row[]).map(toAgent)
+  }
+
+  getAgent(id: number): AgentRow | null {
+    const row = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Row | undefined
+    return row ? toAgent(row) : null
+  }
+
+  insertAgent(a: { kind: AgentKind, name: string, color: string } & Partial<Omit<AgentInput, 'name' | 'color'>>, now: Date): number {
+    const r = this.db.prepare(`INSERT INTO agents (kind, name, color, provider_id, model, reasoning_effort, timeout_seconds, extra_params, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      a.kind, a.name, a.color, a.providerId ?? null, a.model ?? null, a.reasoningEffort ?? null,
+      a.timeoutSeconds ?? null, a.extraParams ? JSON.stringify(a.extraParams) : null, now.toISOString()
+    )
+    return Number(r.lastInsertRowid)
+  }
+
+  updateAgent(id: number, a: AgentUpdate): void {
+    this.db.prepare('UPDATE agents SET name = ?, color = ?, timeout_seconds = CASE WHEN kind = \'llm\' THEN ? ELSE timeout_seconds END WHERE id = ?')
+      .run(a.name, a.color, a.timeoutSeconds, id)
+  }
+
+  setAgentStatus(id: number, status: AgentRow['status'], now: Date): void {
+    this.db.prepare('UPDATE agents SET status = ?, archived_at = ? WHERE id = ?').run(status, status === 'archived' ? now.toISOString() : null, id)
+  }
+
+  /** 只删没有任何资产快照和决策记录的模型（调用方先用 hasActivity 检查） */
+  deleteAgent(id: number): void {
+    this.db.prepare('DELETE FROM entry_state WHERE agent_id = ?').run(id)
+    this.db.prepare('DELETE FROM entries WHERE agent_id = ?').run(id)
+    this.db.prepare('DELETE FROM agents WHERE id = ?').run(id)
+  }
+
+  /** 是否已经参与过运行（有资产快照或决策记录） */
+  hasActivity(agentId: number): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM equity WHERE agent_id = ? UNION ALL SELECT 1 FROM decisions WHERE agent_id = ? LIMIT 1').get(agentId, agentId))
+  }
+
+  // ---------- seasons & entries ----------
+
+  currentSeason(): SeasonRow | null {
+    const row = this.db.prepare('SELECT * FROM seasons WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1').get() as Row | undefined
+    return row ? toSeason(row) : null
+  }
+
+  getSeason(id: number): SeasonRow | null {
+    const row = this.db.prepare('SELECT * FROM seasons WHERE id = ?').get(id) as Row | undefined
+    return row ? toSeason(row) : null
+  }
+
+  listSeasons(): SeasonRow[] {
+    return (this.db.prepare('SELECT * FROM seasons ORDER BY id DESC').all() as Row[]).map(toSeason)
+  }
+
+  /** 结束当前赛季（如果有），开始新赛季，所有参赛中的模型自动加入。 */
+  startSeason(name: string, config: SeasonConfig, now: Date): SeasonRow {
+    return this.transaction(() => {
+      const at = now.toISOString()
+      this.db.prepare('UPDATE seasons SET ended_at = ? WHERE ended_at IS NULL').run(at)
+      const r = this.db.prepare('INSERT INTO seasons (name, config, started_at) VALUES (?, ?, ?)').run(name, JSON.stringify(config), at)
+      const id = Number(r.lastInsertRowid)
+      for (const agent of this.listAgents().filter(a => a.status === 'active')) this.addEntry(id, agent.id, now)
+      return this.getSeason(id)!
+    })
+  }
+
+  renameSeason(id: number, name: string): void {
+    this.db.prepare('UPDATE seasons SET name = ? WHERE id = ?').run(name, id)
+  }
+
+  listEntries(seasonId: number): EntryRow[] {
+    return (this.db.prepare('SELECT * FROM entries WHERE season_id = ? ORDER BY agent_id').all(seasonId) as Row[]).map(toEntry)
+  }
+
+  addEntry(seasonId: number, agentId: number, now: Date): void {
+    this.db.prepare('INSERT OR IGNORE INTO entries (season_id, agent_id, joined_at) VALUES (?, ?, ?)').run(seasonId, agentId, now.toISOString())
+  }
+
+  leaveEntry(seasonId: number, agentId: number, now: Date): void {
+    this.db.prepare('UPDATE entries SET left_at = ? WHERE season_id = ? AND agent_id = ? AND left_at IS NULL').run(now.toISOString(), seasonId, agentId)
+  }
+
+  entry(seasonId: number, agentId: number): EntryState {
+    return new EntryState(this.db, seasonId, agentId)
+  }
+
+  // ---------- ticks & equity ----------
+
+  insertTick(t: Omit<TickRow, 'id'>): number {
+    const r = this.db.prepare('INSERT INTO ticks (season_id, at, trigger, price, error) VALUES (?, ?, ?, ?, ?)').run(t.seasonId, t.at, t.trigger, t.price, t.error)
+    return Number(r.lastInsertRowid)
+  }
+
+  latestTick(seasonId?: number): TickRow | null {
+    const row = (seasonId === undefined
+      ? this.db.prepare('SELECT * FROM ticks ORDER BY id DESC LIMIT 1').get()
+      : this.db.prepare('SELECT * FROM ticks WHERE season_id = ? ORDER BY id DESC LIMIT 1').get(seasonId)) as Row | undefined
+    return row ? toTick(row) : null
+  }
+
+  /** 赛季里第一条有价格的行情快照（赛季“一直持有”基准的起点） */
+  firstPricedTick(seasonId: number): TickRow | null {
+    const row = this.db.prepare('SELECT * FROM ticks WHERE season_id = ? AND price IS NOT NULL ORDER BY id LIMIT 1').get(seasonId) as Row | undefined
+    return row ? toTick(row) : null
+  }
+
+  insertEquity(tickId: number, agentId: number, ledger: Ledger, total: Decimal): void {
+    this.db.prepare('INSERT INTO equity (tick_id, agent_id, usdt, base, total) VALUES (?, ?, ?, ?, ?)')
+      .run(tickId, agentId, ledger.usdt.toFixed(), ledger.base.toFixed(), total.toFixed())
+  }
+
+  /** 每个模型在赛季里最近一次的资产快照 */
+  latestEquity(seasonId: number): Map<number, { at: string, price: string, usdt: string, base: string, total: string }> {
+    const rows = this.db.prepare(`
+      SELECT e.agent_id, e.usdt, e.base, e.total, t.at, t.price FROM equity e
+      JOIN ticks t ON t.id = e.tick_id
+      WHERE e.tick_id = (SELECT MAX(e2.tick_id) FROM equity e2 JOIN ticks t2 ON t2.id = e2.tick_id WHERE e2.agent_id = e.agent_id AND t2.season_id = ?)
+    `).all(seasonId) as Row[]
+    return new Map(rows.map(r => [Number(r.agent_id), { at: String(r.at), price: String(r.price), usdt: String(r.usdt), base: String(r.base), total: String(r.total) }]))
+  }
+
+  /** 每个模型在赛季里的最大回撤（%）：资产从此前最高点回落的最大幅度 */
+  maxDrawdowns(seasonId: number): Map<number, number> {
+    const rows = this.db.prepare(`
+      SELECT agent_id, MAX((peak - total) / peak) * 100 AS dd FROM (
+        SELECT e.agent_id, CAST(e.total AS REAL) AS total,
+          MAX(CAST(e.total AS REAL)) OVER (PARTITION BY e.agent_id ORDER BY e.tick_id ROWS UNBOUNDED PRECEDING) AS peak
+        FROM equity e JOIN ticks t ON t.id = e.tick_id WHERE t.season_id = ?
+      ) WHERE peak > 0 GROUP BY agent_id
+    `).all(seasonId) as Array<{ agent_id: number, dd: number }>
+    return new Map(rows.map(r => [Number(r.agent_id), r.dd]))
+  }
+
+  /**
+   * 资产曲线：赛季里 since 之后的行情快照，点数超过 maxPoints 时等间隔抽样（保留最后一个点），
+   * 带上每个快照里各模型的资产总值。返回抽样步长，前端据此判断断档。
+   */
+  equitySeries(seasonId: number, sinceIso: string, maxPoints: number): { step: number, points: Array<{ t: string, price: string, values: Record<string, string> }> } {
+    const { n } = this.db.prepare('SELECT COUNT(*) AS n FROM ticks WHERE season_id = ? AND at >= ? AND price IS NOT NULL').get(seasonId, sinceIso) as { n: number }
+    const step = Math.max(1, Math.ceil(n / maxPoints))
+    const rows = this.db.prepare(`
+      WITH numbered AS (
+        SELECT id, at, price, ROW_NUMBER() OVER (ORDER BY id) - 1 AS rn FROM ticks
+        WHERE season_id = ? AND at >= ? AND price IS NOT NULL
+      ), picked AS (SELECT id, at, price FROM numbered WHERE rn % ? = 0 OR rn = ? - 1)
+      SELECT p.id, p.at, p.price, e.agent_id, e.total FROM picked p LEFT JOIN equity e ON e.tick_id = p.id ORDER BY p.id
+    `).all(seasonId, sinceIso, step, n) as Array<{ id: number, at: string, price: string, agent_id: number | null, total: string | null }>
+    const points: Array<{ t: string, price: string, values: Record<string, string> }> = []
+    let lastId: number | null = null
+    for (const r of rows) {
+      if (r.id !== lastId) {
+        points.push({ t: r.at, price: r.price, values: {} })
+        lastId = r.id
+      }
+      if (r.agent_id !== null && r.total !== null) points.at(-1)!.values[r.agent_id] = r.total
+    }
+    return { step, points }
+  }
+
+  /**
+   * 时间点之前最后一轮的价格，和各模型在那之前的最后一次资产，作为曲线在这个时间范围内的起点。
+   * 那之前还没运行过（或模型是之后才加入的）就没有对应的值
+   */
+  equityBefore(seasonId: number, beforeIso: string): { price: string | null, values: Record<string, string> } {
+    const tick = this.db.prepare('SELECT price FROM ticks WHERE season_id = ? AND at < ? AND price IS NOT NULL ORDER BY id DESC LIMIT 1')
+      .get(seasonId, beforeIso) as { price: string } | undefined
+    // SQLite 里和 MAX() 一起查询的列取自 MAX 所在的那一行，即每个模型最后一次的资产
+    const rows = this.db.prepare(`
+      SELECT e.agent_id, e.total, MAX(e.tick_id) FROM equity e JOIN ticks t ON t.id = e.tick_id
+      WHERE t.season_id = ? AND t.at < ? GROUP BY e.agent_id
+    `).all(seasonId, beforeIso) as Array<{ agent_id: number, total: string }>
+    return { price: tick?.price ?? null, values: Object.fromEntries(rows.map(r => [r.agent_id, r.total])) }
+  }
+
   // ---------- decisions ----------
 
-  insertDecision(d: Pick<Decision, 'id' | 'createdAt' | 'trigger' | 'symbol' | 'outcome'> & Partial<Decision>): void {
+  insertDecision(d: Decision): void {
     const row = toRow(d)
     const cols = Object.keys(row)
     this.db.prepare(`INSERT INTO decisions (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
       .run(...cols.map(c => row[c]!))
-  }
-
-  updateDecision(id: string, patch: Partial<Decision>): void {
-    const row = toRow(patch)
-    delete row.id
-    const cols = Object.keys(row)
-    if (!cols.length) return
-    this.db.prepare(`UPDATE decisions SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE id = ?`)
-      .run(...cols.map(c => row[c]!), id)
   }
 
   getDecision(id: string): Decision | null {
@@ -269,178 +703,74 @@ export class Store {
     return row ? toDecision(row) : null
   }
 
-  listDecisions(opts: { limit: number, offset: number, onlyActions: boolean }): { items: Decision[], total: number } {
-    const where = opts.onlyActions ? `WHERE ${ACTION_SIGNALS}` : ''
-    const rows = this.db.prepare(`SELECT * FROM decisions ${where} ORDER BY rowid DESC LIMIT ? OFFSET ?`)
-      .all(opts.limit, opts.offset) as Row[]
-    const { n } = this.db.prepare(`SELECT COUNT(*) AS n FROM decisions ${where}`).get() as { n: number }
+  /** onlyActions：只看有交易意图的（买入 / 卖出信号） */
+  listDecisions(opts: { seasonId: number, agentId?: number, onlyActions: boolean, limit: number, offset: number }): { items: Decision[], total: number } {
+    const where = ['season_id = ?']
+    const params: SQLInputValue[] = [opts.seasonId]
+    if (opts.agentId !== undefined) {
+      where.push('agent_id = ?')
+      params.push(opts.agentId)
+    }
+    if (opts.onlyActions) where.push(`signal IN ('buy', 'sell')`)
+    const sql = `FROM decisions WHERE ${where.join(' AND ')}`
+    const rows = this.db.prepare(`SELECT * ${sql} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(...params, opts.limit, opts.offset) as Row[]
+    const { n } = this.db.prepare(`SELECT COUNT(*) AS n ${sql}`).get(...params) as { n: number }
     return { items: rows.map(toDecision), total: n }
   }
 
-  /** 最近 n 条已完成的决策（不含本轮正在运行的） */
-  recentDecisions(n: number): Decision[] {
-    const rows = this.db.prepare(`SELECT * FROM decisions WHERE outcome != 'running' ORDER BY rowid DESC LIMIT ?`).all(n) as Row[]
+  /** 某个模型最近 n 次 LLM 给出的合法决策 */
+  recentLlmDecisions(seasonId: number, agentId: number, n: number): Decision[] {
+    const rows = this.db.prepare(`SELECT * FROM decisions WHERE season_id = ? AND agent_id = ? AND llm_status = 'ok' ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(seasonId, agentId, n) as Row[]
+    return rows.map(toDecision)
+  }
+
+  /** 某个模型最近 n 笔成交 */
+  recentFills(seasonId: number, agentId: number, n: number): Decision[] {
+    const rows = this.db.prepare(`SELECT * FROM decisions WHERE season_id = ? AND agent_id = ? AND outcome = 'filled' ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(seasonId, agentId, n) as Row[]
     return rows.map(toDecision)
   }
 
   /** 某时刻之后的成交笔数 */
-  countFilledSince(iso: string): number {
-    const { n } = this.db.prepare(`SELECT COUNT(*) AS n FROM decisions WHERE outcome = 'filled' AND created_at >= ?`).get(iso) as { n: number }
+  countFillsSince(seasonId: number, agentId: number, iso: string): number {
+    const { n } = this.db.prepare(`SELECT COUNT(*) AS n FROM decisions WHERE season_id = ? AND agent_id = ? AND outcome = 'filled' AND created_at >= ?`).get(seasonId, agentId, iso) as { n: number }
     return n
   }
 
-  /** LLM 决策模式下最近 n 次真正问过 LLM 的决策（不含本轮正在运行的） */
-  recentLlmDecisions(n: number): Decision[] {
-    const rows = this.db.prepare(`SELECT * FROM decisions WHERE mode = 'llm' AND llm_decision IN ('buy', 'sell', 'hold') AND outcome != 'running' ORDER BY rowid DESC LIMIT ?`).all(n) as Row[]
-    return rows.map(toDecision)
-  }
-
-  /** 最近 n 笔成交 */
-  recentFills(n: number): Decision[] {
-    const rows = this.db.prepare(`SELECT * FROM decisions WHERE outcome = 'filled' ORDER BY rowid DESC LIMIT ?`).all(n) as Row[]
-    return rows.map(toDecision)
-  }
-
-  lastFilledAt(): Date | null {
-    const row = this.db.prepare(`SELECT created_at FROM decisions WHERE outcome = 'filled' ORDER BY created_at DESC LIMIT 1`).get() as { created_at: string } | undefined
+  lastFillAt(seasonId: number, agentId: number): Date | null {
+    const row = this.db.prepare(`SELECT created_at FROM decisions WHERE season_id = ? AND agent_id = ? AND outcome = 'filled' ORDER BY created_at DESC LIMIT 1`).get(seasonId, agentId) as { created_at: string } | undefined
     return row ? new Date(row.created_at) : null
   }
 
-  lastDecisionAt(): string | null {
-    const row = this.db.prepare(`SELECT created_at FROM decisions ORDER BY rowid DESC LIMIT 1`).get() as { created_at: string } | undefined
-    return row?.created_at ?? null
-  }
-
-  /** 启动时把上次进程退出时还在“运行中”的记录标记为中断，返回条数。 */
-  markInterrupted(): number {
-    const r = this.db.prepare(`UPDATE decisions SET outcome = 'interrupted', error = COALESCE(error, '进程在本轮运行期间退出，若已提交订单请到 Binance 核对') WHERE outcome = 'running'`).run()
-    return Number(r.changes)
-  }
-
-  // ---------- equity_snapshots ----------
-
-  insertSnapshot(s: Snapshot): void {
-    this.db.prepare(`INSERT INTO equity_snapshots (created_at, decision_id, price, usdt, base, total, benchmark) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(s.createdAt, s.decisionId, s.price, s.usdt, s.base, s.total, s.benchmark)
-  }
-
-  listSnapshots(sinceIso: string): Snapshot[] {
-    const rows = this.db.prepare(`SELECT * FROM equity_snapshots WHERE created_at >= ? ORDER BY id`).all(sinceIso) as SnapshotRow[]
-    return rows.map(toSnapshot)
-  }
-
-  latestSnapshot(): Snapshot | null {
-    const row = this.db.prepare(`SELECT * FROM equity_snapshots ORDER BY id DESC LIMIT 1`).get() as SnapshotRow | undefined
-    return row ? toSnapshot(row) : null
-  }
-
-  // ---------- state ----------
-
-  private getState<T>(key: string): T | null {
-    const row = this.db.prepare('SELECT value FROM state WHERE key = ?').get(key) as { value: string } | undefined
-    return row ? JSON.parse(row.value) as T : null
-  }
-
-  private setState(key: string, value: unknown): void {
-    this.db.prepare('INSERT INTO state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
-      .run(key, JSON.stringify(value))
-  }
-
-  /** 面板里的设置；没保存过的项用默认值 */
-  getSettings(): Settings {
-    return settingsSchema.parse(this.getState('settings') ?? {})
-  }
-
-  setSettings(s: Settings): void {
-    this.setState('settings', s)
-  }
-
-  /**
-   * 重新开始策略账本（修改预算时调用）：清掉账本、初始预算和价格、当天起始资产，下一轮按新预算重新初始化。
-   * 决策记录、资产快照、暂停状态、止损后的买入锁定和已处理信号都保留。
-   */
-  resetLedger(): void {
-    this.db.prepare(`DELETE FROM state WHERE key IN ('ledger', 'initial', 'day_start', 'position')`).run()
-  }
-
-  getLedger(): Ledger | null {
-    const v = this.getState<{ usdt: string, base: string }>('ledger')
-    return v ? { usdt: new Decimal(v.usdt), base: new Decimal(v.base) } : null
-  }
-
-  setLedger(l: Ledger): void {
-    this.setState('ledger', { usdt: l.usdt.toFixed(), base: l.base.toFixed() })
-  }
-
-  getPosition(): Position | null {
-    const v = this.getState<{ cost: string, peak: string }>('position')
-    return v ? { cost: new Decimal(v.cost), peak: new Decimal(v.peak) } : null
-  }
-
-  setPosition(p: Position | null): void {
-    this.setState('position', p && { cost: p.cost.toFixed(), peak: p.peak.toFixed() })
-  }
-
-  getReentryLock(): ReentryLock | null {
-    return this.getState<ReentryLock>('reentry_lock')
-  }
-
-  setReentryLock(v: ReentryLock | null): void {
-    this.setState('reentry_lock', v)
-  }
-
-  getPause(): PauseState {
-    return this.getState<PauseState>('pause') ?? { paused: false, reason: null, source: null, until: null, since: null }
-  }
-
-  setPause(p: PauseState): void {
-    this.setState('pause', p)
-  }
-
-  getInitial(): InitialState | null {
-    return this.getState<InitialState>('initial')
-  }
-
-  setInitial(v: InitialState): void {
-    this.setState('initial', v)
-  }
-
-  /** 最近一次处理过的信号所在 K 线（开盘时间）和方向 */
-  getHandledSignal(): { candle: number, signal: 'buy' | 'sell' } | null {
-    return this.getState('handled_signal')
-  }
-
-  setHandledSignal(v: { candle: number, signal: 'buy' | 'sell' }): void {
-    this.setState('handled_signal', v)
-  }
-
-  /** LLM 决策模式最近一次问过 LLM 的时段（如 candle:1760000000000），同一时段只问一次 */
-  getLlmSlot(): string | null {
-    return this.getState<string>('llm_slot')
-  }
-
-  setLlmSlot(v: string): void {
-    this.setState('llm_slot', v)
-  }
-
-  getDayStart(): DayStart | null {
-    return this.getState<DayStart>('day_start')
-  }
-
-  setDayStart(v: DayStart): void {
-    this.setState('day_start', v)
-  }
-}
-
-/** 只读地取出数据库里保存的设置（回测用，不改动正式数据库）；数据库不存在或没保存过时返回 null。 */
-export function readStoredSettings(path: string): unknown {
-  if (!existsSync(path)) return null
-  const db = new DatabaseSync(path, { readOnly: true })
-  try {
-    const hasState = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'state'`).get()
-    const row = hasState ? db.prepare(`SELECT value FROM state WHERE key = 'settings'`).get() as { value: string } | undefined : undefined
-    return row ? JSON.parse(row.value) : null
-  } finally {
-    db.close()
+  /** 各模型在赛季里的成交和 LLM 询问统计 */
+  entryStats(seasonId: number): Map<number, EntryStats> {
+    const rows = this.db.prepare(`
+      SELECT agent_id,
+        SUM(outcome = 'filled') AS trades,
+        SUM(outcome = 'filled' AND order_side = 'sell') AS sells,
+        SUM(outcome = 'filled' AND order_side = 'sell' AND CAST(realized_pnl AS REAL) > 0) AS wins,
+        TOTAL(CASE WHEN outcome = 'filled' THEN CAST(fee_usdt AS REAL) END) AS fees,
+        SUM(llm_status IS NOT NULL) AS asked,
+        SUM(llm_status = 'ok') AS ok,
+        SUM(llm_status = 'invalid_output') AS invalid,
+        SUM(llm_status = 'request_failed') AS failed,
+        AVG(CASE WHEN llm_status != 'request_failed' THEN llm_duration_ms END) AS avg_ms,
+        TOTAL(llm_prompt_tokens) AS prompt_tokens,
+        TOTAL(llm_completion_tokens) AS completion_tokens
+      FROM decisions WHERE season_id = ? GROUP BY agent_id
+    `).all(seasonId) as Array<Record<string, number | null>>
+    return new Map(rows.map(r => [Number(r.agent_id), {
+      agentId: Number(r.agent_id),
+      trades: Number(r.trades ?? 0),
+      sells: Number(r.sells ?? 0),
+      wins: Number(r.wins ?? 0),
+      fees: Number(r.fees ?? 0),
+      llmAsked: Number(r.asked ?? 0),
+      llmOk: Number(r.ok ?? 0),
+      llmInvalid: Number(r.invalid ?? 0),
+      llmFailed: Number(r.failed ?? 0),
+      llmAvgDurationMs: r.avg_ms === null ? null : Math.round(Number(r.avg_ms)),
+      llmPromptTokens: Number(r.prompt_tokens ?? 0),
+      llmCompletionTokens: Number(r.completion_tokens ?? 0)
+    }]))
   }
 }

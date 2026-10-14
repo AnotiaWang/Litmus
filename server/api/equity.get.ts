@@ -1,3 +1,4 @@
+/** 资产曲线。?season= 指定赛季（默认当前赛季），?days= 最近多少天 */
 import { z } from 'zod'
 import { getRuntime } from '../lib/runtime'
 import { equityView } from '../lib/views'
@@ -8,5 +9,5 @@ const query = z.object({
 
 export default defineEventHandler(async (event) => {
   const { days } = await getValidatedQuery(event, query.parse)
-  return equityView(getRuntime().store, days)
+  return equityView(getRuntime().store, await seasonFromQuery(event), days)
 })

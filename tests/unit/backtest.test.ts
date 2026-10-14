@@ -1,9 +1,13 @@
 /** 回测：用合成的历史 K 线跑真实引擎，不访问网络 */
 import Decimal from 'decimal.js'
 import { describe, expect, it } from 'vitest'
-import { fetchHistory, formatReport, parseBacktestDays, runBacktest } from '../../server/lib/backtest'
-import { MockExchange, type Kline } from '../../server/lib/exchange'
-import { makeKlines, testConfig } from './helpers'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fetchHistory, formatReport, parseBacktestDays, readCurrentSeasonConfig, runBacktest } from '../../server/lib/backtest'
+import { Store } from '../../server/lib/db'
+import { MockMarket, type Kline } from '../../server/lib/market'
+import { makeKlines, NOW, testSeasonConfig } from './helpers'
 
 const END = Date.UTC(2026, 9, 1)
 
@@ -17,17 +21,18 @@ function cycleCloses(): number[] {
   return closes.map((c, i) => c + (i % 2 ? 300 : -300))
 }
 
-const rules = new MockExchange().rules
+const rules = new MockMarket().rules
 
 describe('回测', () => {
   it('一轮涨跌里完成买入和卖出，统计结果和资产快照一致', async () => {
-    const config = testConfig({ llmEnabled: false, budgetUsdt: '1000', maxOrderUsdt: '500' })
+    const config = testSeasonConfig({ initialCapital: '1000' })
     const report = await runBacktest({ config, klines: makeKlines(cycleCloses(), END), rules })
     expect(report.candles).toBe(180)
     expect(report.trades.length).toBeGreaterThanOrEqual(2)
     expect(report.trades[0]!.side).toBe('buy')
     expect(report.trades.some(t => t.side === 'sell')).toBe(true)
-    expect(report.roundTrips).toBeGreaterThanOrEqual(1)
+    expect(report.sells).toBeGreaterThanOrEqual(1)
+    expect(report.wins).toBeLessThanOrEqual(report.sells)
     expect(report.outcomes.filled).toBe(report.trades.length)
     expect(Number(report.fees)).toBeGreaterThan(0)
     expect(Number(report.maxDrawdownPct)).toBeGreaterThanOrEqual(0)
@@ -35,13 +40,14 @@ describe('回测', () => {
     expect(new Decimal(report.finalEquity).minus(1000).div(10).toFixed(2)).toBe(report.returnPct)
 
     const text = formatReport(config, report).join('\n')
-    expect(text).toContain('策略收益率')
+    expect(text).toContain('收益率')
+    expect(text).toContain('SMA20/50 连续 2 根确认')
     expect(text).toContain('同期一直持有')
     expect(text).toContain('买入')
   })
 
   it('K 线不足时报错', async () => {
-    await expect(runBacktest({ config: testConfig(), klines: makeKlines(cycleCloses().slice(0, 100), END), rules })).rejects.toThrow(/K 线不足/)
+    await expect(runBacktest({ config: testSeasonConfig(), klines: makeKlines(cycleCloses().slice(0, 100), END), rules })).rejects.toThrow(/K 线不足/)
   })
 
   it('分页拉取历史 K 线，去掉未收盘的', async () => {
@@ -66,5 +72,15 @@ describe('回测', () => {
     expect(parseBacktestDays('30')).toBe(30)
     expect(() => parseBacktestDays('0')).toThrow(/BACKTEST_DAYS/)
     expect(() => parseBacktestDays('abc')).toThrow(/BACKTEST_DAYS/)
+  })
+
+  it('读取正式数据库里当前赛季的配置（只读）；数据库不存在时返回 null', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'litmus-bt-'))
+    expect(readCurrentSeasonConfig(join(dir, 'none.db'))).toBeNull()
+    const path = join(dir, 'litmus.db')
+    const store = new Store(path)
+    store.startSeason('第 1 赛季', testSeasonConfig({ klineInterval: '4h' }), NOW)
+    store.close()
+    expect(readCurrentSeasonConfig(path)).toMatchObject({ klineInterval: '4h', initialCapital: '100' })
   })
 })

@@ -1,11 +1,11 @@
 /**
- * 规则策略：用均线 + RSI 产生买 / 卖 / 观望信号，再加上按持仓成本的止损（止损检查 LLM 决策模式也用）。
+ * 均线基线：用均线 + RSI 产生买 / 卖 / 观望信号，再加上按持仓成本的止损（止损检查 LLM 模型也用）。
  *
- * 这是教学用的简单策略，目的是让整条流水线有一个可解释的起点，而不是追求收益。
+ * 这是 benchmark 里的参照选手：参数固定（见 BASELINE_PARAMS），不调用 LLM，用来回答“模型有没有跑赢一个简单的均线策略”。
  * - SMA（简单移动平均）：最近 N 根 K 线收盘价的平均值。短期均线在长期均线上方通常被看作趋势向上。
  * - RSI（相对强弱指数，0~100）：衡量近期涨跌力度。数值很高说明短期涨得很猛，可能“过热”。
  *
- * 两种模式（SIGNAL_MODE）：
+ * 两种模式（基线固定用 trend）：
  * - trend（默认）：看均线当前所处的状态。空仓且短期均线在上方、RSI 未过热就买；持仓且短期均线跌到下方就卖。
  *   不依赖“恰好在交叉那根 K 线上”，服务中途停过也不会错过。
  *   均线在交叉附近常常来回穿越，所以要连续 confirmBars 根 K 线都在上方 / 下方才算数，减少来回买卖。
@@ -15,7 +15,7 @@
  * 止损按当前价判断（每轮都检查），其余信号只使用已经收盘的 K 线，避免同一轮里信号来回跳。
  * 指标是统计量而非金额，所以这里用普通 number 计算即可。
  */
-import type { Kline } from './exchange'
+import type { Kline } from './market'
 
 export type Signal = 'buy' | 'sell' | 'hold'
 
@@ -35,6 +35,17 @@ export interface StrategyParams {
   /** 价格低于持仓以来最高价这么多 % 时止损，0 为关闭 */
   trailingStopPct: number
 }
+
+/** 均线基线的固定参数（止损来自赛季的风险设置）。指标也按这组周期算好发给 LLM 参考 */
+export const BASELINE_PARAMS = {
+  mode: 'trend',
+  smaFast: 20,
+  smaSlow: 50,
+  rsiPeriod: 14,
+  rsiBuyMax: 70,
+  rsiSellMin: 100,
+  confirmBars: 2
+} as const satisfies Omit<StrategyParams, 'stopLossPct' | 'trailingStopPct'>
 
 /** 持仓状况，由引擎根据策略账本算好传进来 */
 export interface PositionContext {

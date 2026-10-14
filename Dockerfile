@@ -14,8 +14,9 @@ FROM node:24-slim
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8000 \
-    # 收到停止信号后最多等 280 秒，让正在跑的一轮决策完成并记账。
-    # LLM 超时最长 120 秒、失败重试 1 次，一轮最坏约 4 分钟；没有在跑的轮次时会立即退出
+    # 收到停止信号后最多等 280 秒，让正在跑的一轮决策完成并记账；没有在跑的轮次时会立即退出。
+    # 各模型并行询问，默认超时 120 秒、失败重试 1 次，一轮最坏约 4 分钟。超时设得更长的模型可能等不完，
+    # 被中断的模型这一轮不记账（模拟撮合，没有真实订单），下一轮会重新询问
     NITRO_SHUTDOWN_TIMEOUT=280000
 COPY --from=build /app/.output ./.output
 RUN mkdir -p /app/data

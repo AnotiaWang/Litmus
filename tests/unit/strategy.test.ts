@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { atr, closedKlines, evaluate, marketStats, rsi, sma, stopLine, streak, type PositionContext } from '../../server/lib/strategy'
-import { deathCrossCloses, flatCloses, goldenCrossCloses, hotGoldenCrossCloses, makeKlines, steadyRiseCloses, testConfig } from './helpers'
+import { atr, BASELINE_PARAMS, closedKlines, evaluate, marketStats, rsi, sma, stopLine, streak, type PositionContext } from '../../server/lib/strategy'
+import { deathCrossCloses, downtrendCloses, flatCloses, goldenCrossCloses, hotGoldenCrossCloses, makeKlines, steadyRiseCloses, STRATEGY_FIXTURE, uptrendCloses } from './helpers'
 
-const params = testConfig().strategy
+const params = STRATEGY_FIXTURE
 
 describe('指标计算', () => {
   it('SMA 取最近 N 个值的平均', () => {
@@ -207,5 +207,21 @@ describe('规则信号', () => {
       expect(stopLine({ stopLossPct: 5, trailingStopPct: 0 }, 50000, 54000)).toEqual({ price: 47500, kind: 'stop_loss' })
       expect(stopLine({ stopLossPct: 0, trailingStopPct: 0 }, 50000, 54000)).toBeNull()
     })
+  })
+})
+
+describe('均线基线的固定参数', () => {
+  const base = { ...BASELINE_PARAMS, stopLossPct: 5, trailingStopPct: 0 }
+  const k = (closes: number[]) => makeKlines(closes, Date.UTC(2026, 9, 8))
+  const flat = { hasPosition: false, price: 52000, entryPrice: null, peakPrice: null, reentryLocked: false }
+
+  it('trend 模式、连续 2 根确认、不止盈', () => {
+    expect(BASELINE_PARAMS).toMatchObject({ mode: 'trend', smaFast: 20, smaSlow: 50, rsiPeriod: 14, confirmBars: 2, rsiSellMin: 100 })
+  })
+
+  it('测试行情：只交叉了 1 根时不买，连续 2 根才买；连续 2 根在下方时卖', () => {
+    expect(evaluate(k(goldenCrossCloses()), base, flat).signal).toBe('hold')
+    expect(evaluate(k(uptrendCloses()), base, flat)).toMatchObject({ signal: 'buy', kind: 'trend_up' })
+    expect(evaluate(k(downtrendCloses()), base, { ...flat, hasPosition: true, price: 48000, entryPrice: 48000, peakPrice: 48000 })).toMatchObject({ signal: 'sell', kind: 'trend_down' })
   })
 })

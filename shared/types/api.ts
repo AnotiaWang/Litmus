@@ -2,18 +2,20 @@
  * 前后端共用的接口数据类型。
  * 金额、数量、价格都是字符串（保留 decimal.js 的完整精度），前端显示时再格式化。
  */
-import type { Settings } from '../settings'
+import type { AppSettings, SeasonConfig } from '../settings'
 
 export type Outcome
-  = | 'running' // 正在运行（进程中断时会留下这个状态）
-    | 'hold' // 观望
-    | 'paused' // 暂停中，只记录信号
-    | 'llm_reject' // LLM 否决
+  = | 'hold' // 观望
+    | 'paused' // 暂停中，不询问 LLM、不交易
     | 'risk_block' // 风控拦截
-    | 'filled' // 已成交
-    | 'unfilled' // 已提交但没有成交
+    | 'filled' // 已成交（模拟撮合）
     | 'error' // 出错
-    | 'interrupted' // 进程中断
+
+/** llm：LLM 决策；baseline：均线规则基线，不调用 LLM */
+export type AgentKind = 'llm' | 'baseline'
+
+/** LLM 这次询问的结果：ok 给出了合法决策；invalid_output 有返回但不合格；request_failed 请求失败（超时、网络、HTTP 错误） */
+export type LlmStatus = 'ok' | 'invalid_output' | 'request_failed'
 
 /**
  * 一次 LLM 请求的记录（重试时每次一条），供面板查看调用详情。
@@ -52,45 +54,56 @@ export interface LlmPrompt {
   user: string
 }
 
+/**
+ * 一条决策记录：某个模型在某一轮里做了什么。
+ * 只在真正问过 LLM、触发止损、规则给出买卖信号或出错时记录；其余轮次只记资产快照。
+ */
 export interface Decision {
   id: string
+  seasonId: number
+  agentId: number
+  tickId: number
+  /** 这一轮行情快照的时间 */
   createdAt: string
-  trigger: 'schedule' | 'manual'
-  symbol: string
-  /** 这一轮的决策方式；升级前的旧记录为 null（都是规则模式） */
-  mode: 'rules' | 'llm' | null
-  price: string | null
-  /** 规则模式的指标；LLM 决策模式不计算，为 null */
+  /** 快照价格，成交也按这个价格 */
+  price: string
+  /** 均线基线的指标；LLM 模型为 null */
   indicators: Record<string, number> | null
-  /** 规则模式是规则信号；LLM 决策模式是 LLM 给出的动作（止损时为 sell） */
+  /** 这一轮的动作：基线是规则信号；LLM 模型是 LLM 给出的动作；止损时为 sell */
   signal: 'buy' | 'sell' | 'hold' | null
-  /** 信号说明。LLM 决策模式只在程序代为处理时有（止损、没到询问时间、暂停、LLM 出错等） */
+  /** 程序给出的说明（止损、规则信号原因、暂停、LLM 出错等） */
   signalNote: string | null
-  /** 规则模式：复核结论 approve / reject；LLM 决策模式：buy / sell / hold */
-  llmDecision: 'approve' | 'reject' | 'buy' | 'sell' | 'hold' | null
+  llmStatus: LlmStatus | null
+  llmDecision: 'buy' | 'sell' | 'hold' | null
   llmSizePct: number | null
   llmConfidence: number | null
   llmReason: string | null
   llmRaw: string | null
-  /** 升级前的旧记录为 null */
   llmCalls: LlmCall[] | null
   llmPrompt: LlmPrompt | null
+  /** 这次询问所有请求（含重试）的总耗时 */
+  llmDurationMs: number | null
+  llmPromptTokens: number | null
+  llmCompletionTokens: number | null
   riskPassed: boolean | null
   riskRule: string | null
   riskReason: string | null
-  orderSide: 'BUY' | 'SELL' | null
+  orderSide: 'buy' | 'sell' | null
+  /** 风控算出的买入金额（USDT，含手续费） */
   orderQuoteAmount: string | null
+  /** 风控算出的卖出数量 */
   orderQty: string | null
-  orderId: string | null
-  orderStatus: string | null
   filledQty: string | null
+  /** 成交金额（USDT，不含手续费） */
   filledQuote: string | null
-  commission: string | null
+  feeUsdt: string | null
+  /** 卖出时这部分持仓的已实现盈亏（扣除买卖手续费） */
+  realizedPnl: string | null
   outcome: Outcome
   error: string | null
 }
 
-/** 列表里的决策不含 LLM 原始返回和调用详情（可能较长），详情接口再给 */
+/** 列表里的决策不含 LLM 原始返回、调用详情和提示词（可能较长），详情接口再给 */
 export type DecisionSummary = Omit<Decision, 'llmRaw' | 'llmCalls' | 'llmPrompt'>
 
 export interface DecisionsResponse {
@@ -98,64 +111,157 @@ export interface DecisionsResponse {
   total: number
 }
 
-export interface StatusResponse {
-  running: boolean
-  paused: boolean
-  pauseReason: string | null
-  pauseSource: 'manual' | 'daily_loss' | 'reconcile' | null
-  pausedUntil: string | null
-  mode: 'demo' | 'testnet'
-  symbol: string
-  intervalMinutes: number
-  decisionMode: 'rules' | 'llm'
-  /** LLM 决策模式的询问频率说明，如“每根 4h K 线收盘后”；规则模式为 null */
-  llmCadence: string | null
-  llmEnabled: boolean
-  /** 策略参数，面板用来解释指标（如“SMA20 = 最近 20 根 1h K 线的平均价”） */
-  strategy: { klineInterval: string, smaFast: number, smaSlow: number, rsiPeriod: number }
-  nextRunAt: string | null
-  lastRunAt: string | null
+export interface SeasonSummary {
+  id: number
+  name: string
+  startedAt: string
+  endedAt: string | null
+  config: SeasonConfig
 }
 
-export type AccountResponse
-  = | { ready: false, baseAsset: string, budget: string }
-    | {
-      ready: true
-      asOf: string
-      baseAsset: string
-      budget: string
-      initialPrice: string
-      startedAt: string
-      price: string
-      usdt: string
-      base: string
-      positionValue: string
-      /** 持仓均价（含买入手续费）；空仓时为 null */
-      entryPrice: string | null
-      /** 当前生效的止损价（止损 / 移动止损中较高的一条）；空仓或未开启时为 null */
-      stopPrice: string | null
-      total: string
-      returnPct: string
-      benchmark: string
-      benchmarkReturnPct: string
-      /** 超额收益：策略收益率减去一直持有的收益率，单位是百分点 */
-      excessReturnPct: string
-    }
+/** 公开的模型信息：不含 Provider 地址和 Key */
+export interface AgentPublic {
+  id: number
+  kind: AgentKind
+  name: string
+  color: string
+  /** 请求时的模型名；基线为 null */
+  model: string | null
+  /** Provider 显示名；基线为 null */
+  provider: string | null
+  reasoningEffort: string | null
+  status: 'active' | 'archived'
+  createdAt: string
+  archivedAt: string | null
+}
+
+/** 某个模型在某个赛季里的成绩和当前状态 */
+export interface Standing {
+  agent: AgentPublic
+  joinedAt: string
+  /** 归档时间；还在参赛时为 null */
+  leftAt: string | null
+  /** 账本初始化（第一次参与运行）的时间和价格；还没运行过时为 null */
+  startedAt: string | null
+  startPrice: string | null
+  /** 以下为最近一次资产快照；还没运行过时为 null */
+  equity: string | null
+  usdt: string | null
+  base: string | null
+  positionValue: string | null
+  /** 持仓均价（含买入手续费）；空仓时为 null */
+  entryPrice: string | null
+  /** 当前生效的止损价；空仓或未开启时为 null */
+  stopPrice: string | null
+  returnPct: string | null
+  /** 同期一直持有（从 startedAt 起）的收益率 */
+  benchmarkReturnPct: string | null
+  /** 超额收益：收益率减去一直持有的收益率，单位是百分点 */
+  excessReturnPct: string | null
+  maxDrawdownPct: string | null
+  /** 成交笔数、其中卖出笔数和盈利的卖出笔数 */
+  trades: number
+  sells: number
+  wins: number
+  feesUsdt: string
+  /**
+   * LLM 询问统计；基线为 null。asked = ok + invalidOutput + requestFailed：
+   * 输出不合格是模型的问题，请求失败（超时、网络、HTTP 错误）是服务的问题，成功率只按前两种算
+   */
+  llm: {
+    asked: number
+    ok: number
+    invalidOutput: number
+    requestFailed: number
+    /** 平均耗时，不含请求失败的询问 */
+    avgDurationMs: number | null
+    promptTokens: number
+    completionTokens: number
+  } | null
+  /** 当日亏损熔断中（只停买入）；没有时为 null */
+  circuit: { reason: string, until: string } | null
+}
+
+export interface StandingsResponse {
+  season: SeasonSummary
+  /** 最近一次行情快照的时间和价格 */
+  asOf: string | null
+  price: string | null
+  /** 从赛季开始一直持有的收益率 */
+  benchmarkReturnPct: string | null
+  standings: Standing[]
+}
+
+export interface StatusResponse {
+  /** 是否正在运行一轮 */
+  running: boolean
+  /** 手动暂停：所有模型都不询问 LLM、不交易，资产照常记录 */
+  paused: boolean
+  pausedAt: string | null
+  nextRunAt: string | null
+  lastTick: { at: string, error: string | null } | null
+  season: SeasonSummary | null
+}
 
 export interface EquityResponse {
-  points: Array<{ t: string, total: string, benchmark: string, price: string }>
-  /** 正常运行时相邻两点的间隔（毫秒）：当前运行间隔 × 抽样步长。手动运行会多出点，实际间隔只会更短 */
+  seasonId: number
+  /**
+   * 每个点是一轮行情快照：价格和各模型的资产总值（按模型 ID）。
+   * 模型中途加入或归档，那段时间就没有它的值
+   */
+  points: Array<{ t: string, price: string, values: Record<string, string> }>
+  /** 赛季第一轮的价格，用来画“一直持有”的参考线；还没运行过时为 null */
+  startPrice: string | null
+  /**
+   * 所选范围开始前最后一轮的价格和各模型的资产，曲线的收益率从这里算起。
+   * 范围覆盖了赛季开头（或模型是范围内才加入的）就没有对应的值，按赛季起始价和初始资金算
+   */
+  base: { price: string | null, values: Record<string, string> }
+  /** 正常运行时相邻两点的间隔（毫秒）：运行间隔 × 抽样步长，用来识别停机造成的断档 */
   intervalMs: number
 }
 
 export type RunResult
   = | { status: 'busy' }
-    | { status: 'done', decisionId: string, outcome: Outcome }
+    | { status: 'done', tickId: number | null, error: string | null, outcomes: Array<{ agentId: number, outcome: Outcome, decisionId: string | null }> }
 
-export interface SettingsResponse {
-  settings: Settings
-  /** .env 里是否配置了 LLM 连接信息；没配置时不能开启 LLM */
-  llmConfigured: boolean
-  /** 现在不能修改预算的原因（持仓中、正在运行）；可以修改时为 null */
-  budgetLock: string | null
+/** 当前访问者的权限，前端据此决定显示登录框还是公开页面 */
+export interface SessionResponse {
+  publicRead: boolean
+  admin: boolean
+}
+
+export interface ProviderView {
+  id: number
+  name: string
+  baseUrl: string
+  /** 打码后的 Key，如 sk-a…wxyz */
+  apiKeyMasked: string
+  createdAt: string
+  /** 挂在这个 Provider 下的模型数（含已归档），有模型时不能删除 */
+  agentCount: number
+}
+
+export interface AgentAdminView extends AgentPublic {
+  providerId: number | null
+  timeoutSeconds: number | null
+  extraParams: Record<string, unknown> | null
+  /** 还没有任何资产快照和决策记录时可以直接删除，否则只能归档 */
+  deletable: boolean
+}
+
+export interface AdminSettingsResponse {
+  app: AppSettings
+}
+
+/** 测试一个模型：用当前行情和一个空仓账本问一次，不记录、不交易 */
+export interface AgentTestResult {
+  ok: boolean
+  action: 'buy' | 'sell' | 'hold'
+  sizePct: number
+  confidence: number
+  reason: string
+  error: string | null
+  durationMs: number
+  calls: LlmCall[]
 }

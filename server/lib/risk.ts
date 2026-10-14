@@ -13,9 +13,9 @@
  * 所有金额用 decimal.js 计算，避免 0.1 + 0.2 ≠ 0.3 这类浮点误差。
  */
 import Decimal from 'decimal.js'
-import type { Config } from './config'
 import { RISK_RULE_LABELS, type RiskRule } from '../../shared/risk-rules'
-import { floorToStep, type SymbolRules } from './exchange'
+import type { RiskParams } from '../../shared/settings'
+import { floorToStep, type SymbolRules } from './market'
 
 export { RISK_RULE_LABELS, type RiskRule }
 
@@ -23,21 +23,21 @@ export interface PrecheckInput {
   side: 'buy' | 'sell'
   price: Decimal
   ledger: { usdt: Decimal, base: Decimal }
-  /** 可卖数量 = min(账本持币, 账户真实可用余额) */
-  sellableBase: Decimal
   rules: SymbolRules
-  limits: Config['risk']
-  /** 今天（UTC）已成交笔数 */
+  limits: RiskParams
+  /** 今天（UTC）已成交笔数（买卖都算） */
   tradesToday: number
   lastTradeAt: Date | null
   now: Date
   /** UTC 0 点的账本资产快照；还没有快照时为 null */
   dayStartEquity: Decimal | null
   equity: Decimal
+  /** 当日亏损熔断中的原因（熔断到下一个 UTC 0 点，期间不买入）；没有熔断时为 null */
+  circuit?: string | null
 }
 
 export interface RiskInput extends PrecheckInput {
-  /** 买入：动用账本可用 USDT 的比例（0~100），LLM 关闭时传 100。卖出：卖掉持币的比例，规则模式固定 100，LLM 决策模式由 LLM 给出 */
+  /** 买入：动用账本可用 USDT 的比例（0~100），均线基线传 100。卖出：卖掉持币的比例，止损和基线固定 100 */
   sizePct: number
 }
 
@@ -46,7 +46,7 @@ export interface RiskResult {
   rule?: RiskRule
   /** 拦截原因，或放行时金额被调整的说明 */
   reason: string
-  /** 买入金额（USDT） */
+  /** 买入金额（USDT，含手续费） */
   quoteAmount?: Decimal
   /** 卖出数量（币） */
   quantity?: Decimal
@@ -65,10 +65,11 @@ export function precheck(input: PrecheckInput): RiskResult | null {
   const { limits, ledger, rules } = input
 
   if (input.side === 'sell') {
-    if (ledger.base.lte(0) || input.sellableBase.lte(0)) return block('no_position', '账本没有持币')
+    if (ledger.base.lte(0)) return block('no_position', '账本没有持币')
     return null
   }
 
+  if (input.circuit) return block('daily_loss', input.circuit)
   const loss = dailyLossPct(input.dayStartEquity, input.equity)
   if (loss.gte(limits.dailyLossLimitPct)) {
     return block('daily_loss', `今日已亏损 ${loss.toFixed(2)}%，达到 ${limits.dailyLossLimitPct}% 上限`)
@@ -92,6 +93,10 @@ export function precheck(input: PrecheckInput): RiskResult | null {
   return null
 }
 
+/** 单笔买入上限：总资产的 maxOrderPct% */
+export const maxOrderUsdt = ({ ledger, price, limits }: Pick<PrecheckInput, 'ledger' | 'price' | 'limits'>) =>
+  ledger.usdt.plus(ledger.base.mul(price)).mul(limits.maxOrderPct).div(100)
+
 /** 买入后持币市值不能超过账本总资产的 maxPositionPct%，返回还能买多少 USDT。 */
 function positionRoom({ ledger, price, limits }: PrecheckInput) {
   const positionValue = ledger.base.mul(price)
@@ -110,9 +115,10 @@ export function evaluateRisk(input: RiskInput): RiskResult {
   if (input.side === 'buy') {
     const suggested = ledger.usdt.mul(input.sizePct).div(100)
     let amount = suggested
-    if (amount.gt(limits.maxOrderUsdt)) {
-      amount = limits.maxOrderUsdt
-      notes.push(`按单笔上限调小到 ${amount.toFixed(2)}`)
+    const maxOrder = maxOrderUsdt(input)
+    if (amount.gt(maxOrder)) {
+      amount = maxOrder
+      notes.push(`按单笔上限（总资产的 ${limits.maxOrderPct}%）调小到 ${amount.toFixed(2)}`)
     }
     if (amount.gt(ledger.usdt)) {
       amount = ledger.usdt
@@ -126,21 +132,17 @@ export function evaluateRisk(input: RiskInput): RiskResult {
     // USDT 金额保留两位小数，向下取整
     amount = amount.toDecimalPlaces(2, Decimal.ROUND_DOWN)
     if (amount.lt(rules.minNotional) || amount.lte(0)) {
-      return block('min_notional', `金额 ${amount.toFixed(2)} USDT 低于交易所最小下单额 ${rules.minNotional.toFixed()}（LLM 建议 ${suggested.toFixed(2)}）`)
+      return block('min_notional', `金额 ${amount.toFixed(2)} USDT 低于交易所最小下单额 ${rules.minNotional.toFixed()}（按比例应为 ${suggested.toFixed(2)}）`)
     }
     return { passed: true, reason: notes.length ? notes.join('；') : '未调整', quoteAmount: amount }
   }
 
-  // 卖出：不做空，只能卖账本里已有、且账户里确实可用的币（是否有币已在 precheck 检查过）
+  // 卖出：不做空，只能卖账本里已有的币（是否有币已在 precheck 检查过）
   let qty = ledger.base.mul(input.sizePct).div(100)
   // 只卖一部分时，剩下的如果不够最小下单额就再也卖不掉了，干脆全部卖出
   if (input.sizePct < 100 && ledger.base.minus(qty).mul(input.price).lt(rules.minNotional)) {
     qty = ledger.base
     notes.push('剩余部分不足最小下单额，改为全部卖出')
-  }
-  if (qty.gt(input.sellableBase)) {
-    qty = input.sellableBase
-    notes.push(`按可用余额调小到 ${qty.toFixed()}`)
   }
   qty = floorToStep(qty, rules.stepSize)
   if (qty.lt(rules.minQty) || qty.lte(0)) {

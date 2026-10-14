@@ -1,9 +1,10 @@
 <script setup lang="ts">
 /**
- * 决策记录表：每轮一行，点击一行展开指标、LLM 理由、风控说明、成交和错误信息。
+ * 决策记录表：每条一行，点击展开说明、LLM 理由、风控和成交详情。
+ * 传了 agents 时多一列“模型”（排行榜页看所有模型），模型详情页不传。
  */
 import type { TableColumn } from '@nuxt/ui'
-import type { DecisionSummary, StatusResponse } from '#shared/types/api'
+import type { AgentPublic, DecisionSummary } from '#shared/types/api'
 import { RISK_RULE_LABELS, type RiskRule } from '#shared/risk-rules'
 
 const props = defineProps<{
@@ -13,24 +14,26 @@ const props = defineProps<{
   pageSize: number
   /** 不在第 1 页时，自上次加载以来新增的记录数 */
   newCount: number
-  strategy?: StatusResponse['strategy']
-  /** 需要自动展开的记录（手动运行一次后指向新记录） */
-  expandId: string | null
+  symbol: string
+  agents?: Map<number, AgentPublic>
+  /** 需要自动展开的记录 */
+  expandId?: string | null
+  title?: string
 }>()
 const page = defineModel<number>('page', { required: true })
 const onlyActions = defineModel<boolean>('onlyActions', { required: true })
 
-const terms = computed(() => glossary(props.strategy))
+const base = computed(() => baseAssetOf(props.symbol))
 
-const columns: TableColumn<DecisionSummary>[] = [
+const columns = computed<TableColumn<DecisionSummary>[]>(() => [
   { accessorKey: 'createdAt', header: '时间' },
+  ...(props.agents ? [{ accessorKey: 'agentId', header: '模型' }] : []),
   { accessorKey: 'price', header: '价格' },
-  { accessorKey: 'signal', header: '信号' },
-  { accessorKey: 'llmDecision', header: 'LLM 结论' },
+  { accessorKey: 'signal', header: '动作' },
   { accessorKey: 'riskPassed', header: '风控' },
   { accessorKey: 'outcome', header: '结果' },
   { id: 'expand', header: '' }
-]
+])
 
 const expanded = ref<Record<string, boolean>>({})
 watch([page, onlyActions], () => {
@@ -48,10 +51,12 @@ function showLlmDetail(id: string) {
   detailOpen.value = true
 }
 
-const isLlmMode = (d: DecisionSummary) => d.mode === 'llm'
-
-/** 规则模式的卖出、LLM 决策模式的止损都不经过 LLM，由程序直接执行 */
-const skipsLlm = (d: DecisionSummary) => d.signal === 'sell' && d.llmDecision === null
+/** 动作是谁给出的：均线基线带指标；问过 LLM 的有 LLM 状态；其余是程序（止损） */
+function source(d: DecisionSummary): string {
+  if (d.indicators) return '规则'
+  if (d.llmStatus) return 'LLM'
+  return '程序'
+}
 
 function riskLabel(d: DecisionSummary): string {
   if (d.riskPassed === null) return '-'
@@ -61,10 +66,10 @@ function riskLabel(d: DecisionSummary): string {
 
 function fillText(d: DecisionSummary): string {
   if (d.outcome !== 'filled' || !d.filledQty) return ''
-  const side = d.orderSide === 'BUY' ? '买入' : '卖出'
-  return `${side} ${fmtQty(d.filledQty)}，${fmtNumber(d.filledQuote)} USDT`
+  return `${d.orderSide === 'buy' ? '买入' : '卖出'} ${fmtQty(d.filledQty)} ${base.value}`
 }
 
+const agentOf = (id: number) => props.agents?.get(id)
 const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice(v)
 </script>
 
@@ -74,7 +79,7 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
       <div class="flex items-center justify-between gap-2">
         <div class="flex flex-wrap items-center gap-2">
           <h2 class="font-semibold">
-            决策记录
+            {{ title ?? '决策记录' }}
             <span class="ml-1 text-sm font-normal text-muted">共 {{ total }} 条</span>
           </h2>
           <UButton
@@ -89,7 +94,7 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
         </div>
         <USwitch
           v-model="onlyActions"
-          label="只看买卖信号"
+          label="只看买卖"
         />
       </div>
     </template>
@@ -105,70 +110,59 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
       @select="(_e: Event, row: { toggleExpanded: () => void }) => row.toggleExpanded()"
     >
       <template #signal-header>
-        <TermHint :text="terms.signal">
-          信号
-        </TermHint>
-      </template>
-      <template #llmDecision-header>
-        <TermHint :text="terms.llm">
-          LLM 结论
+        <TermHint :text="GLOSSARY.action">
+          动作
         </TermHint>
       </template>
       <template #riskPassed-header>
-        <TermHint :text="terms.risk">
+        <TermHint :text="GLOSSARY.risk">
           风控
         </TermHint>
       </template>
       <template #createdAt-cell="{ row }">
         <span class="whitespace-nowrap">{{ fmtTime(row.original.createdAt) }}</span>
-        <UBadge
-          v-if="row.original.trigger === 'manual'"
-          class="ml-1"
-          size="sm"
-          color="neutral"
-          variant="outline"
+      </template>
+      <template #agentId-cell="{ row }">
+        <span
+          v-if="agentOf(row.original.agentId)"
+          class="flex items-center gap-1.5 whitespace-nowrap"
         >
-          手动
-        </UBadge>
+          <span
+            class="size-2 shrink-0 rounded-full"
+            :style="{ backgroundColor: agentOf(row.original.agentId)!.color }"
+          />
+          {{ agentOf(row.original.agentId)!.name }}
+        </span>
+        <span v-else>-</span>
       </template>
       <template #price-cell="{ row }">
-        {{ fmtPrice(row.original.price) }}
+        <span class="tabular-nums">{{ fmtPrice(row.original.price) }}</span>
       </template>
       <template #signal-cell="{ row }">
-        <div
-          v-if="row.original.signal"
-          class="flex items-center gap-1"
-        >
+        <div class="flex items-center gap-1">
           <UBadge
-            :color="SIGNALS[row.original.signal].color"
+            v-if="row.original.signal"
+            :color="ACTIONS[row.original.signal].color"
             variant="subtle"
           >
-            {{ SIGNALS[row.original.signal].label }}
+            {{ row.original.llmStatus === 'ok' ? actionText(row.original.signal, row.original.llmSizePct) : ACTIONS[row.original.signal].label }}
           </UBadge>
           <UBadge
-            v-if="isLlmMode(row.original)"
             size="sm"
             color="neutral"
             variant="outline"
           >
-            {{ row.original.llmDecision ? 'LLM' : '程序' }}
+            {{ source(row.original) }}
+          </UBadge>
+          <UBadge
+            v-if="row.original.llmStatus && row.original.llmStatus !== 'ok'"
+            size="sm"
+            :color="LLM_STATUS[row.original.llmStatus].color"
+            variant="subtle"
+          >
+            {{ LLM_STATUS[row.original.llmStatus].label }}
           </UBadge>
         </div>
-        <span v-else>-</span>
-      </template>
-      <template #llmDecision-cell="{ row }">
-        <span
-          v-if="row.original.llmDecision"
-          :class="LLM_DECISIONS[row.original.llmDecision].className"
-        >{{ llmDecisionText(row.original) }}</span>
-        <span
-          v-else-if="skipsLlm(row.original)"
-          class="text-muted"
-        >不复核</span>
-        <span
-          v-else
-          class="text-muted"
-        >-</span>
       </template>
       <template #riskPassed-cell="{ row }">
         <span :class="row.original.riskPassed === false ? 'text-warning' : row.original.riskPassed ? 'text-success' : 'text-muted'">
@@ -199,45 +193,54 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
 
       <template #expanded="{ row }">
         <div class="grid cursor-default gap-4 text-sm whitespace-normal sm:grid-cols-2">
-          <div>
+          <div v-if="row.original.signalNote || row.original.indicators">
             <p class="font-medium">
-              {{ isLlmMode(row.original) ? '程序' : '规则信号' }}
+              {{ row.original.indicators ? '规则信号' : '程序' }}
             </p>
-            <p class="text-muted">
-              {{ row.original.signalNote ?? (isLlmMode(row.original) ? '由 LLM 决策，见右侧' : '-') }}
+            <p
+              v-if="row.original.signalNote"
+              class="text-muted"
+            >
+              {{ row.original.signalNote }}
             </p>
             <p
               v-if="row.original.indicators"
               class="mt-1 text-muted"
             >
               收盘价 {{ fmtIndicator(row.original.indicators.close) }} ·
-              <TermHint :text="terms.smaFast">
-                短期均线{{ strategy ? ` SMA${strategy.smaFast}` : '' }}
-              </TermHint>
-              {{ fmtIndicator(row.original.indicators.smaFast) }} ·
-              <TermHint :text="terms.smaSlow">
-                长期均线{{ strategy ? ` SMA${strategy.smaSlow}` : '' }}
-              </TermHint>
-              {{ fmtIndicator(row.original.indicators.smaSlow) }} ·
-              <TermHint :text="terms.rsi">
-                RSI{{ strategy?.rsiPeriod ?? '' }}
-              </TermHint>
-              {{ fmtNumber(row.original.indicators.rsi) }}
+              SMA20 {{ fmtIndicator(row.original.indicators.smaFast) }} ·
+              SMA50 {{ fmtIndicator(row.original.indicators.smaSlow) }} ·
+              RSI14 {{ fmtNumber(row.original.indicators.rsi) }}
             </p>
           </div>
-          <div v-if="row.original.llmDecision">
+          <div v-if="row.original.llmStatus">
             <p class="font-medium">
-              {{ isLlmMode(row.original) ? 'LLM 决策' : 'LLM 复核' }}
+              LLM 决策
             </p>
-            <p class="text-muted">
-              {{ llmDecisionText(row.original) }} ·
-              <TermHint :text="terms.confidence">
+            <p
+              v-if="row.original.llmStatus === 'ok' && row.original.llmDecision"
+              class="text-muted"
+            >
+              <span :class="ACTIONS[row.original.llmDecision].className">{{ actionText(row.original.llmDecision, row.original.llmSizePct) }}</span> ·
+              <TermHint :text="GLOSSARY.confidence">
                 置信度
               </TermHint>
               {{ row.original.llmConfidence }}
             </p>
-            <p class="mt-1">
+            <p
+              v-else
+              class="text-warning"
+            >
+              {{ LLM_STATUS[row.original.llmStatus].label }}，程序代为观望
+            </p>
+            <p
+              v-if="row.original.llmReason"
+              class="mt-1"
+            >
               {{ row.original.llmReason }}
+            </p>
+            <p class="mt-1 text-xs text-muted">
+              耗时 {{ fmtDuration(row.original.llmDurationMs) }} · 输入 {{ fmtTokens(row.original.llmPromptTokens) }} / 输出 {{ fmtTokens(row.original.llmCompletionTokens) }} token
             </p>
             <UButton
               class="mt-1 px-0"
@@ -246,16 +249,8 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
               icon="i-lucide-brain"
               @click="showLlmDetail(row.original.id)"
             >
-              查看思考过程和调用详情
+              查看思考过程、提示词和调用详情
             </UButton>
-          </div>
-          <div v-else-if="skipsLlm(row.original)">
-            <p class="font-medium">
-              LLM 复核
-            </p>
-            <p class="text-muted">
-              {{ isLlmMode(row.original) ? '止损由程序每轮检查，跌破止损线直接全部卖出，不经过 LLM。' : '卖出（包括止损）不经过 LLM，直接按规则执行。' }}
-            </p>
           </div>
           <div v-if="row.original.riskReason">
             <p class="font-medium">
@@ -268,21 +263,23 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
               v-if="row.original.orderQuoteAmount || row.original.orderQty"
               class="text-muted"
             >
-              计划{{ row.original.orderSide === 'BUY' ? `买入 ${fmtNumber(row.original.orderQuoteAmount)} USDT` : `卖出 ${fmtQty(row.original.orderQty)}` }}
+              计划{{ row.original.orderSide === 'buy' ? `买入 ${fmtNumber(row.original.orderQuoteAmount)} USDT` : `卖出 ${fmtQty(row.original.orderQty)} ${base}` }}
             </p>
           </div>
-          <div v-if="row.original.orderId">
+          <div v-if="row.original.outcome === 'filled'">
             <p class="font-medium">
-              订单
+              成交（模拟撮合）
             </p>
             <p class="text-muted">
-              订单号 {{ row.original.orderId }} · 状态 {{ row.original.orderStatus }}
+              {{ fillText(row.original) }}，按 {{ fmtPrice(row.original.price) }} 成交 {{ fmtNumber(row.original.filledQuote) }} USDT，
+              手续费 {{ fmtNumber(row.original.feeUsdt, 4) }} USDT
             </p>
-            <p class="text-muted">
-              成交 {{ fmtQty(row.original.filledQty) }}，金额 {{ fmtNumber(row.original.filledQuote) }} USDT
-              <template v-if="row.original.commission">
-                · 手续费 {{ row.original.commission }}
-              </template>
+            <p
+              v-if="row.original.realizedPnl"
+              class="text-muted"
+            >
+              这部分持仓盈亏（扣除买卖手续费）
+              <span :class="pnlClass(row.original.realizedPnl)">{{ Number(row.original.realizedPnl) > 0 ? '+' : '' }}{{ fmtNumber(row.original.realizedPnl) }} USDT</span>
             </p>
           </div>
           <div
@@ -317,6 +314,7 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
     <LlmCallDetails
       v-model:open="detailOpen"
       :decision-id="detailId"
+      :agents="agents"
     />
   </UCard>
 </template>

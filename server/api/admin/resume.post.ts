@@ -1,5 +1,5 @@
-import { getRuntime } from '../lib/runtime'
-import { statusView } from '../lib/views'
+import { getRuntime } from '../../lib/runtime'
+import { statusView } from '../../lib/views'
 
 export default defineEventHandler(() => {
   const rt = getRuntime()
