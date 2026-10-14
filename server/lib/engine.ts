@@ -18,7 +18,7 @@ import { randomUUID } from 'node:crypto'
 import Decimal from 'decimal.js'
 import type { SeasonConfig } from '../../shared/settings'
 import type { Outcome, RunResult } from '../../shared/types/api'
-import type { AgentRow, Circuit, Decision, EntryState, PauseState, SeasonRow, Store } from './db'
+import type { AgentRow, Circuit, Decision, DecisionSummary, EntryState, PauseState, SeasonRow, Store } from './db'
 import { applyFill, equityOf, isPosition, paperFill, updatePosition, type Ledger, type Position } from './ledger'
 import { summarizeCalls, type Decider, type DecideInput } from './llm'
 import { log as defaultLog, redact, type Logger } from './logger'
@@ -101,8 +101,8 @@ export function buildDecideInput(p: {
   equity: Decimal
   position: Position | null
   blocked: DecideInput['blocked']
-  recentDecisions: Decision[]
-  recentFills: Decision[]
+  recentDecisions: DecisionSummary[]
+  recentFills: DecisionSummary[]
 }): DecideInput {
   const { config, ledger, price, position } = p
   const entryPrice = position ? position.cost.div(ledger.base) : null

@@ -11,6 +11,8 @@
  * - ticks：每轮一条行情快照，所有模型共用同一份价格
  * - equity：每轮每个模型的资产，用来画曲线、算回撤
  * - decisions：决策记录，只在问过 LLM、触发止损、规则给出买卖信号或出错时写
+ * - decision_details：决策的提示词、LLM 调用详情和原始返回。这些字段很长，单独存放，
+ *   排行榜统计和决策列表只扫 decisions，不用读它们
  * - meta：站点设置、全局暂停等键值对
  */
 import { existsSync, mkdirSync, renameSync } from 'node:fs'
@@ -19,12 +21,12 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import Decimal from 'decimal.js'
 import type { AgentInput, AgentUpdate, ProviderInput } from '../../shared/agents'
 import { appSettingsSchema, seasonConfigFieldsSchema, type AppSettings, type SeasonConfig } from '../../shared/settings'
-import type { AgentKind, Decision, Outcome } from '../../shared/types/api'
+import type { AgentKind, Decision, DecisionSummary, Outcome } from '../../shared/types/api'
 import type { Ledger, Position } from './ledger'
 
-export type { Decision, Outcome }
+export type { Decision, DecisionSummary, Outcome }
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -114,9 +116,6 @@ CREATE TABLE IF NOT EXISTS decisions (
   llm_size_pct REAL,
   llm_confidence REAL,
   llm_reason TEXT,
-  llm_raw TEXT,
-  llm_calls TEXT,
-  llm_prompt TEXT,
   llm_duration_ms INTEGER,
   llm_prompt_tokens INTEGER,
   llm_completion_tokens INTEGER,
@@ -135,9 +134,16 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_agent ON decisions(season_id, agent_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_decisions_created ON decisions(season_id, created_at);
+
+CREATE TABLE IF NOT EXISTS decision_details (
+  decision_id TEXT PRIMARY KEY,
+  llm_raw TEXT,
+  llm_calls TEXT,
+  llm_prompt TEXT
+);
 `
 
-// Decision 字段 ↔ 数据库列
+// DecisionSummary 字段 ↔ decisions 表的列
 const COLUMNS = {
   id: 'id',
   seasonId: 'season_id',
@@ -153,9 +159,6 @@ const COLUMNS = {
   llmSizePct: 'llm_size_pct',
   llmConfidence: 'llm_confidence',
   llmReason: 'llm_reason',
-  llmRaw: 'llm_raw',
-  llmCalls: 'llm_calls',
-  llmPrompt: 'llm_prompt',
   llmDurationMs: 'llm_duration_ms',
   llmPromptTokens: 'llm_prompt_tokens',
   llmCompletionTokens: 'llm_completion_tokens',
@@ -171,26 +174,31 @@ const COLUMNS = {
   realizedPnl: 'realized_pnl',
   outcome: 'outcome',
   error: 'error'
-} as const satisfies Record<keyof Decision, string>
-
-/** 以 JSON 文本存储的字段 */
-const JSON_FIELDS: Array<keyof Decision> = ['indicators', 'llmCalls', 'llmPrompt']
+} as const satisfies Record<keyof DecisionSummary, string>
 
 type Row = Record<string, SQLInputValue>
 
-function toDecision(row: Row): Decision {
+/** JSON 文本列（indicators、llm_calls、llm_prompt）解析回对象 */
+const json = (v: SQLInputValue | undefined) => v ? JSON.parse(String(v)) : null
+
+function toSummary(row: Row): DecisionSummary {
   const d = {} as Record<string, unknown>
   for (const [field, col] of Object.entries(COLUMNS)) d[field] = row[col] ?? null
-  for (const field of JSON_FIELDS) d[field] = d[field] ? JSON.parse(d[field] as string) : null
+  d.indicators = json(row.indicators)
   d.riskPassed = d.riskPassed === null ? null : d.riskPassed === 1
-  return d as unknown as Decision
+  return d as unknown as DecisionSummary
 }
 
-function toRow(d: Decision): Row {
+/** row 是 decisions 左连接 decision_details 的结果；没有详情的记录这几个字段为 null */
+function toDecision(row: Row): Decision {
+  return { ...toSummary(row), llmRaw: row.llm_raw == null ? null : String(row.llm_raw), llmCalls: json(row.llm_calls), llmPrompt: json(row.llm_prompt) }
+}
+
+function toRow(d: DecisionSummary): Row {
   const row: Row = {}
   for (const [field, col] of Object.entries(COLUMNS)) {
-    const value = d[field as keyof Decision]
-    if (JSON_FIELDS.includes(field as keyof Decision)) row[col] = value === null || value === undefined ? null : JSON.stringify(value)
+    const value = d[field as keyof DecisionSummary]
+    if (field === 'indicators') row[col] = value === null || value === undefined ? null : JSON.stringify(value)
     else if (field === 'riskPassed') row[col] = value === null ? null : value ? 1 : 0
     else row[col] = (value ?? null) as SQLInputValue
   }
@@ -439,7 +447,24 @@ export class Store {
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;')
     this.db.exec(SCHEMA)
-    if (this.getMeta('schema_version') === null) this.setMeta('schema_version', SCHEMA_VERSION)
+    const version = this.getMeta<number>('schema_version')
+    if (version === 2) this.migrateDecisionDetails()
+    else if (version === null) this.setMeta('schema_version', SCHEMA_VERSION)
+  }
+
+  /**
+   * 第 2 版把提示词、调用详情和原始返回存在 decisions 表里：搬到 decision_details，再从 decisions 删掉这几列。
+   * 删列后原来的页大半是空的（新记录只追加在后面，不会填回去），VACUUM 一次把表压紧
+   */
+  private migrateDecisionDetails(): void {
+    this.transaction(() => {
+      this.db.exec(`INSERT INTO decision_details (decision_id, llm_raw, llm_calls, llm_prompt)
+        SELECT id, llm_raw, llm_calls, llm_prompt FROM decisions
+        WHERE llm_raw IS NOT NULL OR llm_calls IS NOT NULL OR llm_prompt IS NOT NULL`)
+      for (const col of ['llm_raw', 'llm_calls', 'llm_prompt']) this.db.exec(`ALTER TABLE decisions DROP COLUMN ${col}`)
+      this.setMeta('schema_version', SCHEMA_VERSION)
+    })
+    this.db.exec('VACUUM')
   }
 
   close(): void {
@@ -626,12 +651,18 @@ export class Store {
       .run(tickId, agentId, ledger.usdt.toFixed(), ledger.base.toFixed(), total.toFixed())
   }
 
-  /** 每个模型在赛季里最近一次的资产快照 */
+  /**
+   * 每个模型在赛季里最近一次的资产快照。
+   * 先在这个赛季的行情快照里按模型求最后一轮，再连回资产表：只扫这个赛季的数据，查看旧赛季也不会变慢
+   */
   latestEquity(seasonId: number): Map<number, { at: string, price: string, usdt: string, base: string, total: string }> {
     const rows = this.db.prepare(`
-      SELECT e.agent_id, e.usdt, e.base, e.total, t.at, t.price FROM equity e
+      SELECT e.agent_id, e.usdt, e.base, e.total, t.at, t.price FROM (
+        SELECT e.agent_id, MAX(e.tick_id) AS tick_id FROM equity e JOIN ticks t ON t.id = e.tick_id
+        WHERE t.season_id = ? GROUP BY e.agent_id
+      ) last
+      JOIN equity e ON e.tick_id = last.tick_id AND e.agent_id = last.agent_id
       JOIN ticks t ON t.id = e.tick_id
-      WHERE e.tick_id = (SELECT MAX(e2.tick_id) FROM equity e2 JOIN ticks t2 ON t2.id = e2.tick_id WHERE e2.agent_id = e.agent_id AND t2.season_id = ?)
     `).all(seasonId) as Row[]
     return new Map(rows.map(r => [Number(r.agent_id), { at: String(r.at), price: String(r.price), usdt: String(r.usdt), base: String(r.base), total: String(r.total) }]))
   }
@@ -691,20 +722,26 @@ export class Store {
 
   // ---------- decisions ----------
 
+  /** 写 decisions 和 decision_details 两张表，调用方（引擎）在同一个事务里调用 */
   insertDecision(d: Decision): void {
     const row = toRow(d)
     const cols = Object.keys(row)
     this.db.prepare(`INSERT INTO decisions (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
       .run(...cols.map(c => row[c]!))
+    if (d.llmRaw === null && d.llmCalls === null && d.llmPrompt === null) return
+    this.db.prepare('INSERT INTO decision_details (decision_id, llm_raw, llm_calls, llm_prompt) VALUES (?, ?, ?, ?)').run(
+      d.id, d.llmRaw, d.llmCalls && JSON.stringify(d.llmCalls), d.llmPrompt && JSON.stringify(d.llmPrompt)
+    )
   }
 
   getDecision(id: string): Decision | null {
-    const row = this.db.prepare('SELECT * FROM decisions WHERE id = ?').get(id) as Row | undefined
+    const row = this.db.prepare(`SELECT d.*, x.llm_raw, x.llm_calls, x.llm_prompt FROM decisions d
+      LEFT JOIN decision_details x ON x.decision_id = d.id WHERE d.id = ?`).get(id) as Row | undefined
     return row ? toDecision(row) : null
   }
 
-  /** onlyActions：只看有交易意图的（买入 / 卖出信号） */
-  listDecisions(opts: { seasonId: number, agentId?: number, onlyActions: boolean, limit: number, offset: number }): { items: Decision[], total: number } {
+  /** onlyActions：只看有交易意图的（买入 / 卖出信号）。列表不带提示词和调用详情，要看用 getDecision */
+  listDecisions(opts: { seasonId: number, agentId?: number, onlyActions: boolean, limit: number, offset: number }): { items: DecisionSummary[], total: number } {
     const where = ['season_id = ?']
     const params: SQLInputValue[] = [opts.seasonId]
     if (opts.agentId !== undefined) {
@@ -715,19 +752,19 @@ export class Store {
     const sql = `FROM decisions WHERE ${where.join(' AND ')}`
     const rows = this.db.prepare(`SELECT * ${sql} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?`).all(...params, opts.limit, opts.offset) as Row[]
     const { n } = this.db.prepare(`SELECT COUNT(*) AS n ${sql}`).get(...params) as { n: number }
-    return { items: rows.map(toDecision), total: n }
+    return { items: rows.map(toSummary), total: n }
   }
 
   /** 某个模型最近 n 次 LLM 给出的合法决策 */
-  recentLlmDecisions(seasonId: number, agentId: number, n: number): Decision[] {
+  recentLlmDecisions(seasonId: number, agentId: number, n: number): DecisionSummary[] {
     const rows = this.db.prepare(`SELECT * FROM decisions WHERE season_id = ? AND agent_id = ? AND llm_status = 'ok' ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(seasonId, agentId, n) as Row[]
-    return rows.map(toDecision)
+    return rows.map(toSummary)
   }
 
   /** 某个模型最近 n 笔成交 */
-  recentFills(seasonId: number, agentId: number, n: number): Decision[] {
+  recentFills(seasonId: number, agentId: number, n: number): DecisionSummary[] {
     const rows = this.db.prepare(`SELECT * FROM decisions WHERE season_id = ? AND agent_id = ? AND outcome = 'filled' ORDER BY created_at DESC, rowid DESC LIMIT ?`).all(seasonId, agentId, n) as Row[]
-    return rows.map(toDecision)
+    return rows.map(toSummary)
   }
 
   /** 某时刻之后的成交笔数 */

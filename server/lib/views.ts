@@ -5,8 +5,8 @@
  * 这里返回的内容可能公开给任何人看：不包含 Provider 地址、Key 或口令。
  */
 import Decimal from 'decimal.js'
-import type { AgentPublic, DecisionSummary, EquityResponse, SeasonSummary, Standing, StandingsResponse, StatusResponse } from '../../shared/types/api'
-import type { AgentRow, Decision, SeasonRow, Store } from './db'
+import type { AgentPublic, EquityResponse, SeasonSummary, Standing, StandingsResponse, StatusResponse } from '../../shared/types/api'
+import type { AgentRow, SeasonRow, Store } from './db'
 import type { Engine } from './engine'
 import { stopLine } from './strategy'
 
@@ -132,10 +132,4 @@ export function equityView(store: Store, season: SeasonRow, days: number, now = 
   const { step, points } = store.equitySeries(season.id, since, maxPoints)
   const startPrice = store.firstPricedTick(season.id)?.price ?? null
   return { seasonId: season.id, points, startPrice, base: store.equityBefore(season.id, since), intervalMs: season.config.checkIntervalMinutes * 60_000 * step }
-}
-
-/** 列表里不带 LLM 原始返回、调用详情和提示词（可能较长），详情接口再给。 */
-export function decisionSummary(d: Decision): DecisionSummary {
-  const { llmRaw: _raw, llmCalls: _calls, llmPrompt: _prompt, ...rest } = d
-  return rest
 }

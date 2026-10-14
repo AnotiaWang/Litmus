@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import Decimal from 'decimal.js'
 import { describe, expect, it } from 'vitest'
-import { archiveLegacyDatabase, Store } from '../../server/lib/db'
+import { archiveLegacyDatabase, Store, type Decision } from '../../server/lib/db'
 import { NOW, testSeasonConfig } from './helpers'
 
 const tempDb = () => join(mkdtempSync(join(tmpdir(), 'litmus-db-')), 'litmus.db')
@@ -100,5 +100,85 @@ describe('资产曲线与统计', () => {
     expect(dd.get(b)).toBe(0)
     expect(store.latestEquity(season.id).get(a)).toMatchObject({ total: '130', price: '50003' })
     expect(store.hasActivity(a)).toBe(true)
+  })
+
+  it('最近一次资产快照只看指定赛季：新赛季开始后查看旧赛季，取的是旧赛季最后一轮', () => {
+    const { store, season: s1, a, b } = seeded([[100, 200], [110, null]])
+    const s2 = store.startSeason('S2', testSeasonConfig(), new Date(NOW.getTime() + 3600_000))
+    const tickId = store.insertTick({ seasonId: s2.id, at: new Date(NOW.getTime() + 3600_000).toISOString(), trigger: 'schedule', price: '60000', error: null })
+    store.insertEquity(tickId, a, { usdt: new Decimal(0), base: new Decimal(0) }, new Decimal(999))
+    const old = store.latestEquity(s1.id)
+    expect(old.get(a)).toMatchObject({ total: '110', price: '50001' })
+    expect(old.get(b)).toMatchObject({ total: '200', price: '50000' })
+    const current = store.latestEquity(s2.id)
+    expect([...current.keys()]).toEqual([a])
+    expect(current.get(a)).toMatchObject({ total: '999', price: '60000' })
+  })
+})
+
+describe('决策记录', () => {
+  function decision(store: Store, id: string, details: boolean): Decision {
+    const season = store.currentSeason() ?? store.startSeason('S', testSeasonConfig(), NOW)
+    const agentId = store.listAgents()[0]?.id ?? store.insertAgent({ kind: 'baseline', name: 'A', color: '#000000' }, NOW)
+    const tickId = store.insertTick({ seasonId: season.id, at: NOW.toISOString(), trigger: 'schedule', price: '50000', error: null })
+    return {
+      id, seasonId: season.id, agentId, tickId, createdAt: NOW.toISOString(), price: '50000', indicators: { rsi: 50 },
+      signal: 'hold', signalNote: null, llmStatus: 'ok', llmDecision: 'hold', llmSizePct: 0, llmConfidence: 0.5, llmReason: '观望',
+      llmRaw: details ? '{"action":"hold"}' : null,
+      llmCalls: details
+        ? [{ startedAt: NOW.toISOString(), durationMs: 10, model: 'm', responseModel: null, reasoningEffort: null, jsonMode: true, httpStatus: 200, finishReason: 'stop', reasoning: null, content: '{"action":"hold"}', usage: null, error: null }]
+        : null,
+      llmPrompt: details ? { system: '系统', user: '用户' } : null,
+      llmDurationMs: 10, llmPromptTokens: 1, llmCompletionTokens: 1, riskPassed: true, riskRule: null, riskReason: null,
+      orderSide: null, orderQuoteAmount: null, orderQty: null, filledQty: null, filledQuote: null, feeUsdt: null, realizedPnl: null,
+      outcome: 'hold', error: null
+    }
+  }
+
+  it('提示词、调用详情和原始返回单独存放：详情里有，列表和最近决策里不带', () => {
+    const store = new Store(':memory:')
+    const withDetails = decision(store, 'd1', true)
+    const plain = decision(store, 'd2', false)
+    store.transaction(() => {
+      store.insertDecision(withDetails)
+      store.insertDecision(plain)
+    })
+    expect(store.getDecision('d1')).toEqual(withDetails)
+    expect(store.getDecision('d2')).toEqual(plain)
+    expect(store.db.prepare('SELECT decision_id FROM decision_details').all()).toEqual([{ decision_id: 'd1' }])
+
+    const { items, total } = store.listDecisions({ seasonId: withDetails.seasonId, onlyActions: false, limit: 10, offset: 0 })
+    expect(total).toBe(2)
+    const { llmRaw: _raw, llmCalls: _calls, llmPrompt: _prompt, ...summary } = withDetails
+    expect(items.find(d => d.id === 'd1')).toEqual(summary)
+    expect(store.recentLlmDecisions(withDetails.seasonId, withDetails.agentId, 10).every(d => !('llmPrompt' in d))).toBe(true)
+  })
+
+  it('第 2 版数据库：提示词等字段搬到 decision_details，decisions 表删掉这几列，记录完整可读', () => {
+    const path = tempDb()
+    const setup = new Store(path)
+    const d = decision(setup, 'old', true)
+    setup.close()
+    // 还原成第 2 版的样子：这三列在 decisions 表里，没有 decision_details
+    const v2 = new DatabaseSync(path)
+    v2.exec(`ALTER TABLE decisions ADD COLUMN llm_raw TEXT; ALTER TABLE decisions ADD COLUMN llm_calls TEXT; ALTER TABLE decisions ADD COLUMN llm_prompt TEXT;
+      DROP TABLE decision_details; UPDATE meta SET value = '2' WHERE key = 'schema_version'`)
+    v2.prepare(`INSERT INTO decisions (id, season_id, agent_id, tick_id, created_at, price, indicators, signal, llm_status, llm_decision, llm_size_pct,
+      llm_confidence, llm_reason, llm_duration_ms, llm_prompt_tokens, llm_completion_tokens, risk_passed, outcome, llm_raw, llm_calls, llm_prompt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'hold', 'ok', 'hold', 0, 0.5, '观望', 10, 1, 1, 1, 'hold', ?, ?, ?)`).run(
+      d.id, d.seasonId, d.agentId, d.tickId, d.createdAt, d.price, JSON.stringify(d.indicators), d.llmRaw, JSON.stringify(d.llmCalls), JSON.stringify(d.llmPrompt)
+    )
+    v2.close()
+
+    const store = new Store(path)
+    const columns = (store.db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map(c => c.name)
+    expect(columns).not.toContain('llm_prompt')
+    expect(store.db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()).toEqual({ value: '3' })
+    expect(store.getDecision('old')).toEqual(d)
+    store.close()
+    // 再次打开不会重复迁移
+    const again = new Store(path)
+    expect(again.getDecision('old')).toEqual(d)
+    again.close()
   })
 })

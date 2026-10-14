@@ -1,7 +1,6 @@
 /** 决策记录。?season= 指定赛季（默认当前赛季），?agent= 只看某个模型，?only_actions= 只看买卖 */
 import { z } from 'zod'
 import { getRuntime } from '../../lib/runtime'
-import { decisionSummary } from '../../lib/views'
 
 const query = z.object({
   agent: z.coerce.number().int().positive().optional(),
@@ -13,6 +12,5 @@ const query = z.object({
 export default defineEventHandler(async (event) => {
   const q = await getValidatedQuery(event, query.parse)
   const season = await seasonFromQuery(event)
-  const { items, total } = getRuntime().store.listDecisions({ seasonId: season.id, agentId: q.agent, onlyActions: q.only_actions, limit: q.limit, offset: q.offset })
-  return { items: items.map(decisionSummary), total }
+  return getRuntime().store.listDecisions({ seasonId: season.id, agentId: q.agent, onlyActions: q.only_actions, limit: q.limit, offset: q.offset })
 })
