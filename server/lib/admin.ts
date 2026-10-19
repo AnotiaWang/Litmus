@@ -12,6 +12,7 @@ import Decimal from 'decimal.js'
 import { AGENT_COLORS, BASELINE_COLOR, agentInputSchema, agentUpdateSchema, providerInputSchema, providerUpdateSchema } from '../../shared/agents'
 import { DEFAULT_SEASON_CONFIG, appSettingsSchema, seasonConfigSchema, type AppSettings } from '../../shared/settings'
 import type { AgentAdminView, AgentTestResult, ProviderView, SeasonSummary } from '../../shared/types/api'
+import { ENGINE_VERSION, PROMPT_VERSION } from '../../shared/versions'
 import type { AgentRow, Store } from './db'
 import { buildDecideInput, dailyKlinesFor, KLINE_LIMIT, type Engine } from './engine'
 import { listModels, type Decider } from './llm'
@@ -67,7 +68,7 @@ export function bootstrap(store: Store, now = new Date()): void {
       store.insertAgent({ kind: 'baseline', name: '均线基线', color: BASELINE_COLOR }, now)
     }
   })
-  store.startSeason('第 1 赛季', DEFAULT_SEASON_CONFIG, now)
+  store.startSeason('第 1 赛季', DEFAULT_SEASON_CONFIG, now, { promptVersion: PROMPT_VERSION, engineVersion: ENGINE_VERSION })
 }
 
 // ---------- 站点设置 ----------
@@ -144,6 +145,8 @@ export function listAgentsAdmin(store: Store): AgentAdminView[] {
     providerId: a.providerId,
     timeoutSeconds: a.timeoutSeconds,
     extraParams: a.extraParams,
+    inputPricePerM: a.inputPricePerM,
+    outputPricePerM: a.outputPricePerM,
     deletable: !store.hasActivity(a.id)
   }))
 }
@@ -161,7 +164,7 @@ export function createAgent(deps: AdminDeps, input: unknown): AgentAdminView {
   const a = parse(agentInputSchema, input)
   providerOrThrow(deps.store, a.providerId)
   const now = nowOf(deps)
-  const used = new Set(deps.store.listAgents().filter(x => x.status === 'active').map(x => x.color.toLowerCase()))
+  const used = new Set(deps.store.listAgents().filter(x => x.status !== 'archived').map(x => x.color.toLowerCase()))
   const color = a.color ?? AGENT_COLORS.find(c => !used.has(c)) ?? AGENT_COLORS[deps.store.listAgents().length % AGENT_COLORS.length]!
   const id = deps.store.transaction(() => {
     const id = deps.store.insertAgent({ ...a, kind: 'llm', color }, now)
@@ -195,11 +198,38 @@ export function archiveAgent(deps: AdminDeps, id: number): AgentAdminView {
   return agentView(deps.store, id)
 }
 
+/** 暂停参赛：保留账本、成绩和历史记录，可以恢复；和归档不同，暂停可以撤销 */
+export function pauseAgent(deps: AdminDeps, id: number): AgentAdminView {
+  const agent = agentOrThrow(deps.store, id)
+  if (agent.status === 'archived') throw new AdminError('已归档的模型不能暂停', 409)
+  if (agent.status === 'paused') return agentView(deps.store, id)
+  assertIdle(deps, '暂停模型')
+  deps.store.setAgentStatus(id, 'paused', nowOf(deps))
+  logOf(deps).info(`暂停模型：${agent.name}`)
+  return agentView(deps.store, id)
+}
+
+/** 恢复参赛：从下一轮开始继续，账本和持仓保留 */
+export function resumeAgent(deps: AdminDeps, id: number): AgentAdminView {
+  const agent = agentOrThrow(deps.store, id)
+  if (agent.status === 'archived') throw new AdminError('已归档的模型不能恢复，请新建一个模型', 409)
+  if (agent.status === 'active') return agentView(deps.store, id)
+  assertIdle(deps, '恢复模型')
+  const now = nowOf(deps)
+  deps.store.transaction(() => {
+    deps.store.setAgentStatus(id, 'active', now)
+    const season = deps.store.currentSeason()
+    if (season && !deps.store.listEntries(season.id).some(e => e.agentId === id)) deps.store.addEntry(season.id, id, now)
+  })
+  logOf(deps).info(`恢复模型：${agent.name}`)
+  return agentView(deps.store, id)
+}
+
 /** 删除：只能删还没参与过运行的模型 */
 export function deleteAgent(deps: AdminDeps, id: number): void {
   const agent = agentOrThrow(deps.store, id)
   assertIdle(deps, '删除')
-  if (deps.store.hasActivity(id)) throw new AdminError('这个模型已经参与过运行，只能归档，不能删除', 409)
+  if (deps.store.hasActivity(id)) throw new AdminError('这个模型已经参与过运行，只能暂停或归档，不能删除', 409)
   deps.store.transaction(() => deps.store.deleteAgent(id))
   logOf(deps).info(`删除模型：${agent.name}`)
 }
@@ -227,6 +257,8 @@ export async function testAgent(deps: AdminDeps, id: number): Promise<AgentTestR
       equity: capital,
       position: null,
       blocked: { buy: null, sell: '空仓，没有可卖的币' },
+      riskState: { tradesToday: 0, cooldownRemainingMinutes: 0, circuit: null },
+      accounting: { realizedPnl: '0.00', fees: '0.00' },
       recentDecisions: [],
       recentFills: []
     })
@@ -254,7 +286,7 @@ export function startSeason(deps: AdminDeps, input: { name?: unknown, config?: u
   const config = parse(seasonConfigSchema, input.config ?? {})
   const n = deps.store.listSeasons().length + 1
   const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 60) : `第 ${n} 赛季`
-  const season = deps.store.startSeason(name, config, nowOf(deps))
+  const season = deps.store.startSeason(name, config, nowOf(deps), { promptVersion: PROMPT_VERSION, engineVersion: ENGINE_VERSION })
   logOf(deps).info(`开始新赛季：${name}（${config.symbol}，${config.klineInterval}，初始资金 ${config.initialCapital} USDT）`)
   deps.reschedule()
   return seasonSummary(season)

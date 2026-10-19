@@ -45,6 +45,18 @@ const nextRunText = computed(() => {
 
 const fmtDate = (iso: string) => new Date(iso).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' })
 const period = computed(() => `${fmtDate(props.season.startedAt)} 起${props.season.endedAt ? `，${fmtDate(props.season.endedAt)} 结束` : ''}`)
+
+const versionMismatch = computed(() => {
+  const current = props.standings?.codeVersions
+  if (!current || !props.season.promptVersion) return false
+  return props.season.promptVersion !== current.promptVersion || props.season.engineVersion !== current.engineVersion
+})
+const versionLabel = (v: string) => !v || v === 'legacy' ? '旧版本（未记录）' : v
+const versionText = computed(() => {
+  const current = props.standings?.codeVersions
+  if (!current) return ''
+  return `本赛季开始于 prompt ${versionLabel(props.season.promptVersion)} / engine ${versionLabel(props.season.engineVersion)}，当前代码是 prompt ${current.promptVersion} / engine ${current.engineVersion}。`
+})
 </script>
 
 <template>
@@ -179,6 +191,14 @@ const period = computed(() => `${fmtDate(props.season.startedAt)} 起${props.sea
       </div>
 
       <UAlert
+        v-if="isCurrent && versionMismatch"
+        color="warning"
+        variant="subtle"
+        icon="i-lucide-git-compare"
+        title="提示词或引擎版本与赛季开始时不一致"
+        :description="`${versionText} 中途升级可能让本赛季的成绩混用两个版本，建议开新赛季。`"
+      />
+      <UAlert
         v-if="isCurrent && status?.lastTick?.error"
         color="error"
         variant="subtle"
@@ -186,6 +206,9 @@ const period = computed(() => `${fmtDate(props.season.startedAt)} 起${props.sea
         :title="`最近一轮（${fmtTime(status.lastTick.at)}）出错`"
         :description="status.lastTick.error"
       />
+      <p class="text-xs text-muted">
+        页面时间为本地时区；行情快照、提示词和每日日切使用 UTC（UTC 0 点 = 北京时间 08:00）。
+      </p>
     </div>
   </UCard>
 </template>

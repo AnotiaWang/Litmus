@@ -3,10 +3,10 @@ import Decimal from 'decimal.js'
 import { describe, expect, it, vi } from 'vitest'
 import { AGENT_COLORS } from '../../shared/agents'
 import { DEFAULT_SEASON_CONFIG, RISK_PRESETS } from '../../shared/settings'
-import { AdminError, archiveAgent, bootstrap, createAgent, createProvider, deleteAgent, deleteProvider, listAgentsAdmin, listProvidersView, maskKey, renameSeason, startSeason, testAgent, updateAgent, updateAppSettings, updateProvider, type AdminDeps } from '../../server/lib/admin'
+import { AdminError, archiveAgent, bootstrap, createAgent, createProvider, deleteAgent, deleteProvider, listAgentsAdmin, listProvidersView, maskKey, pauseAgent, renameSeason, resumeAgent, startSeason, testAgent, updateAgent, updateAppSettings, updateProvider, type AdminDeps } from '../../server/lib/admin'
 import { Store } from '../../server/lib/db'
-import { equityView, standingsView, statusView } from '../../server/lib/views'
-import { minutesLater, NOW, PROVIDER_KEY, run, setup, silentLogger, uptrendCloses, type Env } from './helpers'
+import { equityView, healthView, standingsView, statusView } from '../../server/lib/views'
+import { flatCloses, minutesLater, NOW, PROVIDER_KEY, run, setMarket, setup, silentLogger, uptrendCloses, type Env } from './helpers'
 
 const hold = '{"action":"hold","size_pct":0,"confidence":0.5,"reason":"等等"}'
 
@@ -137,11 +137,31 @@ describe('模型', () => {
 
     await run(env)
     expect(listAgentsAdmin(env.store).find(a => a.id === env.llmAgentId)!.deletable).toBe(false)
-    expect(adminError(() => deleteAgent(deps, env.llmAgentId!), 409)).toContain('只能归档')
+    expect(adminError(() => deleteAgent(deps, env.llmAgentId!), 409)).toContain('只能暂停或归档')
     const archived = archiveAgent(deps, env.llmAgentId!)
     expect(archived).toMatchObject({ status: 'archived', archivedAt: minutesLater(1).toISOString() })
     expect(env.store.listEntries(env.season.id)[0]!.leftAt).toBe(minutesLater(1).toISOString())
     expect(standingsView(env.store, env.season).standings[0]).toMatchObject({ leftAt: minutesLater(1).toISOString(), equity: '100' })
+  })
+
+  it('暂停 / 恢复：暂停后不再参赛，成绩和历史保留，可以恢复', async () => {
+    const env = setup({ llm: [hold], baseline: true })
+    await run(env)
+    const deps = admin(env)
+    const paused = pauseAgent(deps, env.llmAgentId!)
+    expect(paused).toMatchObject({ status: 'paused' })
+    expect(env.store.listEntries(env.season.id).map(e => e.agentId)).toContain(env.llmAgentId)
+
+    env.setNow(minutesLater(15))
+    expect((await run(env, 'schedule', env.llmAgentId!)).outcome).toBeNull()
+    expect(standingsView(env.store, env.season).standings.find(s => s.agent.id === env.llmAgentId)).toMatchObject({ agent: { status: 'paused' }, equity: '100' })
+
+    const resumed = resumeAgent(deps, env.llmAgentId!)
+    expect(resumed).toMatchObject({ status: 'active' })
+    setMarket(env, flatCloses(), minutesLater(60))
+    env.setNow(minutesLater(60))
+    expect((await run(env, 'schedule', env.llmAgentId!)).outcome).toBe('hold')
+    expect(adminError(() => pauseAgent(admin(env, { engine: { isRunning: true } }), env.llmAgentId!), 409)).toContain('正在运行')
   })
 
   it('正在运行一轮时不能归档或删除', () => {
@@ -173,7 +193,7 @@ describe('赛季', () => {
     const deps = admin(env)
 
     const s = startSeason(deps, { config: { initialCapital: 2000, riskPreset: 'moderate', klineInterval: '4h' } })
-    expect(s).toMatchObject({ name: '第 2 赛季', endedAt: null, config: { initialCapital: '2000', klineInterval: '4h', risk: RISK_PRESETS.moderate } })
+    expect(s).toMatchObject({ name: '第 2 赛季', endedAt: null, config: { initialCapital: '2000', klineInterval: '4h', risk: RISK_PRESETS.moderate }, promptVersion: expect.any(String), engineVersion: expect.any(String) })
     expect(env.store.getSeason(env.season.id)!.endedAt).toBe(minutesLater(1).toISOString())
     expect(env.store.listEntries(s.id).map(e => e.agentId)).toEqual([env.agentId])
     expect(deps.reschedule).toHaveBeenCalled()
@@ -244,12 +264,23 @@ describe('公开数据', () => {
     expect(dump).not.toContain(PROVIDER_KEY)
   })
 
+  it('健康数据：按赛季汇总成功、重试、耗时和 token；给模型配置单价后能估算成本', async () => {
+    const env = setup({ llm: [hold], baseline: true })
+    env.store.updateAgent(env.llmAgentId!, { name: '测试模型', color: '#2563eb', timeoutSeconds: 30, inputPricePerM: 3, outputPricePerM: 15 })
+    await run(env)
+    const health = healthView(env.store, env.season)
+    const model = health.models.find(m => m.agentId === env.llmAgentId)!
+    expect(model).toMatchObject({ asked: 1, ok: 1, retries: 0, http429: 0, timeouts: 0, promptTokens: 100, completionTokens: 20 })
+    expect(model.costUsd).toBeCloseTo(100 / 1_000_000 * 3 + 20 / 1_000_000 * 15, 6)
+    expect(model.lastAskedAt).toBe(NOW.toISOString())
+  })
+
   it('还没运行过时：排行榜的成绩为空，曲线没有点', () => {
     const env = setup()
     const view = standingsView(env.store, env.season)
     expect(view).toMatchObject({ asOf: null, price: null, benchmarkReturnPct: null })
     expect(view.standings[0]).toMatchObject({ equity: null, returnPct: null, maxDrawdownPct: null, trades: 0 })
-    expect(equityView(env.store, env.season, 30, NOW)).toEqual({ seasonId: env.season.id, points: [], startPrice: null, base: { price: null, values: {} }, intervalMs: 15 * 60_000 })
+    expect(equityView(env.store, env.season, 30, NOW)).toEqual({ seasonId: env.season.id, points: [], startPrice: null, base: { price: null, values: {} }, trades: [], intervalMs: 15 * 60_000 })
   })
 
   it('资产曲线：每轮一个点，带价格和各模型的资产', async () => {
@@ -260,13 +291,22 @@ describe('公开数据', () => {
     const view = equityView(env.store, env.season, 1, minutesLater(16))
     expect(view.points).toHaveLength(2)
     expect(view.startPrice).toBe('50020')
-    expect(view.points[0]).toEqual({ t: NOW.toISOString(), price: '50020', values: { [env.llmAgentId!]: '100', [env.baselineId!]: '100' } })
+    expect(view.points[0]).toEqual({ t: NOW.toISOString(), price: '50020', values: { [env.llmAgentId!]: '100', [env.baselineId!]: '100' }, bases: { [env.llmAgentId!]: '0', [env.baselineId!]: '0' } })
     // 范围覆盖了赛季开头：没有起点值，前端按初始资金和赛季起始价算
     expect(view.base).toEqual({ price: null, values: {} })
     // 范围从第二轮开始：起点是第一轮的价格和资产
     const later = equityView(env.store, env.season, 1, new Date(minutesLater(10).getTime() + 86_400_000))
     expect(later.points).toHaveLength(1)
     expect(later.base).toEqual({ price: '50020', values: { [env.llmAgentId!]: '100', [env.baselineId!]: '100' } })
+  })
+
+  it('资产曲线带成交和持币数量，用来画买卖点和持仓区间', async () => {
+    const env = setup({ llm: ['{"action":"buy","size_pct":50,"confidence":0.6,"reason":"试试"}'], baseline: false })
+    await run(env)
+    const view = equityView(env.store, env.season, 1, NOW)
+    expect(view.trades).toHaveLength(1)
+    expect(view.trades[0]).toMatchObject({ agentId: env.llmAgentId, side: 'buy', price: '50020' })
+    expect(Number(view.points[0]!.bases[env.llmAgentId!])).toBeGreaterThan(0)
   })
 
   it('状态：运行间隔、上一轮、暂停和当前赛季', async () => {

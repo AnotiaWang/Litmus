@@ -85,6 +85,10 @@ export interface Decision {
   llmDurationMs: number | null
   llmPromptTokens: number | null
   llmCompletionTokens: number | null
+  /** 重试次数（calls.length - 1）；以及其中命中的 HTTP 429 / 超时次数 */
+  llmRetries: number
+  llmHttp429: number
+  llmTimeouts: number
   riskPassed: boolean | null
   riskRule: string | null
   riskReason: string | null
@@ -117,6 +121,9 @@ export interface SeasonSummary {
   startedAt: string
   endedAt: string | null
   config: SeasonConfig
+  /** 赛季开始时使用的提示词 / 引擎版本；历史赛季可能为 legacy */
+  promptVersion: string
+  engineVersion: string
 }
 
 /** 公开的模型信息：不含 Provider 地址和 Key */
@@ -130,7 +137,7 @@ export interface AgentPublic {
   /** Provider 显示名；基线为 null */
   provider: string | null
   reasoningEffort: string | null
-  status: 'active' | 'archived'
+  status: 'active' | 'paused' | 'archived'
   createdAt: string
   archivedAt: string | null
 }
@@ -163,7 +170,18 @@ export interface Standing {
   trades: number
   sells: number
   wins: number
+  /** 手续费合计、已实现盈亏、当前持仓的浮动盈亏 */
   feesUsdt: string
+  realizedPnl: string
+  unrealizedPnl: string | null
+  /** 卖出盈亏比 = 盈利卖出总额 ÷ 亏损卖出总额；没有亏损卖出时为 null */
+  profitFactor: number | null
+  /** 整个赛季的平均持币市值占比（按每轮资产快照计算） */
+  avgExposurePct: number | null
+  /** 每轮收益率的标准差 × √轮数，近似整个期间的波动幅度 */
+  periodVolPct: number | null
+  /** 平均每轮收益率是否显著不为 0：t = 均值 ÷ 标准误 */
+  returnTStat: number | null
   /**
    * LLM 询问统计；基线为 null。asked = ok + invalidOutput + requestFailed：
    * 输出不合格是模型的问题，请求失败（超时、网络、HTTP 错误）是服务的问题，成功率只按前两种算
@@ -175,11 +193,34 @@ export interface Standing {
     requestFailed: number
     /** 平均耗时，不含请求失败的询问 */
     avgDurationMs: number | null
+    p50DurationMs: number | null
+    p95DurationMs: number | null
+    maxDurationMs: number | null
     promptTokens: number
     completionTokens: number
+    /** 重试次数（含 429、超时后的第二次请求） */
+    retries: number
+    http429: number
+    timeouts: number
+    /** 按模型配置的单价估算的累计成本（USD）；没配置单价时为 null */
+    costUsd: number | null
   } | null
   /** 当日亏损熔断中（只停买入）；没有时为 null */
   circuit: { reason: string, until: string } | null
+}
+
+/** 一个赛季的样本量，用来判断排行榜是否已经具备统计意义 */
+export interface SampleStats {
+  days: number
+  rounds: number
+  decisions: number
+  trades: number
+}
+
+/** 当前代码里的版本，和赛季开始时记录的版本对比 */
+export interface CodeVersions {
+  promptVersion: string
+  engineVersion: string
 }
 
 export interface StandingsResponse {
@@ -190,6 +231,10 @@ export interface StandingsResponse {
   /** 从赛季开始一直持有的收益率 */
   benchmarkReturnPct: string | null
   standings: Standing[]
+  /** 本赛季的样本量 */
+  sample: SampleStats
+  /** 当前代码版本，前端用来提示赛季中途升级 */
+  codeVersions: CodeVersions
 }
 
 export interface StatusResponse {
@@ -203,13 +248,23 @@ export interface StatusResponse {
   season: SeasonSummary | null
 }
 
+export interface EquityTrade {
+  t: string
+  agentId: number
+  side: 'buy' | 'sell'
+  price: string
+  qty: string
+  quote: string
+  realizedPnl: string | null
+}
+
 export interface EquityResponse {
   seasonId: number
   /**
-   * 每个点是一轮行情快照：价格和各模型的资产总值（按模型 ID）。
+   * 每个点是一轮行情快照：价格、各模型的资产总值和持币数量（按模型 ID）。
    * 模型中途加入或归档，那段时间就没有它的值
    */
-  points: Array<{ t: string, price: string, values: Record<string, string> }>
+  points: Array<{ t: string, price: string, values: Record<string, string>, bases: Record<string, string> }>
   /** 赛季第一轮的价格，用来画“一直持有”的参考线；还没运行过时为 null */
   startPrice: string | null
   /**
@@ -217,6 +272,8 @@ export interface EquityResponse {
    * 范围覆盖了赛季开头（或模型是范围内才加入的）就没有对应的值，按赛季起始价和初始资金算
    */
   base: { price: string | null, values: Record<string, string> }
+  /** 所选时间范围内的全部成交，用来在曲线上画买卖点 */
+  trades: EquityTrade[]
   /** 正常运行时相邻两点的间隔（毫秒）：运行间隔 × 抽样步长，用来识别停机造成的断档 */
   intervalMs: number
 }
@@ -246,8 +303,42 @@ export interface AgentAdminView extends AgentPublic {
   providerId: number | null
   timeoutSeconds: number | null
   extraParams: Record<string, unknown> | null
+  /** 可选的 token 单价（每百万 token，美元），只用于面板估算成本，不影响交易 */
+  inputPricePerM: number | null
+  outputPricePerM: number | null
   /** 还没有任何资产快照和决策记录时可以直接删除，否则只能归档 */
   deletable: boolean
+}
+
+/** 管理页的模型健康数据：按赛季汇总 LLM 稳定性 */
+export interface AdminHealthModel {
+  agentId: number
+  name: string
+  color: string
+  status: AgentPublic['status']
+  lastAskedAt: string | null
+  lastError: string | null
+  lastErrorAt: string | null
+  asked: number
+  ok: number
+  invalidOutput: number
+  requestFailed: number
+  retries: number
+  http429: number
+  timeouts: number
+  avgDurationMs: number | null
+  p50DurationMs: number | null
+  p95DurationMs: number | null
+  maxDurationMs: number | null
+  promptTokens: number
+  completionTokens: number
+  costUsd: number | null
+}
+
+export interface AdminHealthResponse {
+  seasonId: number
+  asOf: string | null
+  models: AdminHealthModel[]
 }
 
 export interface AdminSettingsResponse {

@@ -39,7 +39,7 @@ describe('LLM 模型', () => {
     expect(input.klines).toHaveLength(48)
     expect(input).toMatchObject({ position: null, blocked: { buy: null, sell: '空仓，没有可卖的币' }, cadence: '每根 1h K 线收盘后', limits: { maxBuyUsdt: '50.00', maxOrderPct: 50 } })
     expect(decision!.llmPrompt!.user).toContain('可用 100.00 USDT')
-    expect(decision!.llmPrompt!.user).toContain('现在能否卖出：不可以（空仓，没有可卖的币）')
+    expect(decision!.llmPrompt!.user).toContain('不可卖（空仓，没有可卖的币）')
   })
 
   it('日线：发给 LLM 的 K 线覆盖不到 14 天时附上最近 14 根已收盘日线；覆盖得到、或没有 LLM 模型参赛时不取', async () => {

@@ -81,6 +81,13 @@ useSeoMeta({ title: () => agent.value ? `${agent.value.name} · Litmus` : 'Litmu
               基线
             </UBadge>
             <UBadge
+              v-if="agent.status === 'paused'"
+              color="warning"
+              variant="subtle"
+            >
+              已暂停
+            </UBadge>
+            <UBadge
               v-if="agent.status === 'archived'"
               color="neutral"
               variant="subtle"
@@ -112,6 +119,10 @@ useSeoMeta({ title: () => agent.value ? `${agent.value.name} · Litmus` : 'Litmu
       />
 
       <template v-else>
+        <SampleNotice
+          :sample="standings.sample"
+          :standings="standings.standings"
+        />
         <UAlert
           v-if="standing.circuit"
           color="error"
@@ -141,6 +152,7 @@ useSeoMeta({ title: () => agent.value ? `${agent.value.name} · Litmus` : 'Litmu
           :points="equity.points"
           :start-price="equity.startPrice"
           :base="equity.base"
+          :trades="equity.trades"
           :interval-ms="equity.intervalMs"
           :capital="season.config.initialCapital"
           :agents="chartAgents"
@@ -150,6 +162,14 @@ useSeoMeta({ title: () => agent.value ? `${agent.value.name} · Litmus` : 'Litmu
         <USkeleton
           v-else
           class="h-96 w-full"
+        />
+
+        <RiskChart
+          v-if="equity"
+          v-model:days="days"
+          :points="equity.points"
+          :interval-ms="equity.intervalMs"
+          :agents="chartAgents"
         />
 
         <DecisionTable

@@ -26,7 +26,7 @@ import type { Ledger, Position } from './ledger'
 
 export type { Decision, DecisionSummary, Outcome }
 
-const SCHEMA_VERSION = 3
+const SCHEMA_VERSION = 4
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS agents (
   reasoning_effort TEXT,
   timeout_seconds INTEGER,
   extra_params TEXT,
+  input_price_per_m REAL,
+  output_price_per_m REAL,
   status TEXT NOT NULL DEFAULT 'active',
   created_at TEXT NOT NULL,
   archived_at TEXT
@@ -61,6 +63,8 @@ CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   config TEXT NOT NULL,
+  prompt_version TEXT NOT NULL DEFAULT '',
+  engine_version TEXT NOT NULL DEFAULT '',
   started_at TEXT NOT NULL,
   ended_at TEXT
 );
@@ -119,6 +123,9 @@ CREATE TABLE IF NOT EXISTS decisions (
   llm_duration_ms INTEGER,
   llm_prompt_tokens INTEGER,
   llm_completion_tokens INTEGER,
+  llm_retries INTEGER NOT NULL DEFAULT 0,
+  llm_http_429 INTEGER NOT NULL DEFAULT 0,
+  llm_timeouts INTEGER NOT NULL DEFAULT 0,
   risk_passed INTEGER,
   risk_rule TEXT,
   risk_reason TEXT,
@@ -162,6 +169,9 @@ const COLUMNS = {
   llmDurationMs: 'llm_duration_ms',
   llmPromptTokens: 'llm_prompt_tokens',
   llmCompletionTokens: 'llm_completion_tokens',
+  llmRetries: 'llm_retries',
+  llmHttp429: 'llm_http_429',
+  llmTimeouts: 'llm_timeouts',
   riskPassed: 'risk_passed',
   riskRule: 'risk_rule',
   riskReason: 'risk_reason',
@@ -223,7 +233,9 @@ export interface AgentRow {
   reasoningEffort: string | null
   timeoutSeconds: number | null
   extraParams: Record<string, unknown> | null
-  status: 'active' | 'archived'
+  inputPricePerM: number | null
+  outputPricePerM: number | null
+  status: 'active' | 'paused' | 'archived'
   createdAt: string
   archivedAt: string | null
 }
@@ -232,6 +244,8 @@ export interface SeasonRow {
   id: number
   name: string
   config: SeasonConfig
+  promptVersion: string
+  engineVersion: string
   startedAt: string
   endedAt: string | null
 }
@@ -290,6 +304,9 @@ export interface EntryStats {
   sells: number
   wins: number
   fees: number
+  realizedPnl: number
+  grossProfit: number
+  grossLoss: number
   llmAsked: number
   llmOk: number
   llmInvalid: number
@@ -297,6 +314,9 @@ export interface EntryStats {
   llmAvgDurationMs: number | null
   llmPromptTokens: number
   llmCompletionTokens: number
+  llmRetries: number
+  llmHttp429: number
+  llmTimeouts: number
 }
 
 const str = (v: SQLInputValue | undefined) => v === null || v === undefined ? null : String(v)
@@ -312,6 +332,8 @@ function toAgent(r: Row): AgentRow {
     reasoningEffort: str(r.reasoning_effort),
     timeoutSeconds: r.timeout_seconds === null ? null : Number(r.timeout_seconds),
     extraParams: r.extra_params ? JSON.parse(String(r.extra_params)) : null,
+    inputPricePerM: r.input_price_per_m === null || r.input_price_per_m === undefined ? null : Number(r.input_price_per_m),
+    outputPricePerM: r.output_price_per_m === null || r.output_price_per_m === undefined ? null : Number(r.output_price_per_m),
     status: r.status as AgentRow['status'],
     createdAt: String(r.created_at),
     archivedAt: str(r.archived_at)
@@ -323,6 +345,8 @@ function toSeason(r: Row): SeasonRow {
     id: Number(r.id),
     name: String(r.name),
     config: seasonConfigFieldsSchema.parse(JSON.parse(String(r.config))),
+    promptVersion: str(r.prompt_version) ?? '',
+    engineVersion: str(r.engine_version) ?? '',
     startedAt: String(r.started_at),
     endedAt: str(r.ended_at)
   }
@@ -380,12 +404,12 @@ export class EntryState {
   }
 
   getPosition(): Position | null {
-    const v = this.get<{ cost: string, peak: string }>('position')
-    return v ? { cost: new Decimal(v.cost), peak: new Decimal(v.peak) } : null
+    const v = this.get<{ cost: string, peak: string, openedAt?: string }>('position')
+    return v ? { cost: new Decimal(v.cost), peak: new Decimal(v.peak), ...(v.openedAt ? { openedAt: v.openedAt } : {}) } : null
   }
 
   setPosition(p: Position | null): void {
-    this.set('position', p && { cost: p.cost.toFixed(), peak: p.peak.toFixed() })
+    this.set('position', p && { cost: p.cost.toFixed(), peak: p.peak.toFixed(), ...(p.openedAt ? { openedAt: p.openedAt } : {}) })
   }
 
   getInitial(): InitialState | null {
@@ -447,9 +471,18 @@ export class Store {
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;')
     this.db.exec(SCHEMA)
-    const version = this.getMeta<number>('schema_version')
-    if (version === 2) this.migrateDecisionDetails()
-    else if (version === null) this.setMeta('schema_version', SCHEMA_VERSION)
+    let version = this.getMeta<number>('schema_version')
+    if (version === 2) {
+      this.migrateDecisionDetails()
+      this.setMeta('schema_version', 3)
+      version = 3
+    }
+    if (version === 3) {
+      this.migrateV4()
+      this.setMeta('schema_version', 4)
+      version = 4
+    }
+    if (version === null) this.setMeta('schema_version', SCHEMA_VERSION)
   }
 
   /**
@@ -462,9 +495,30 @@ export class Store {
         SELECT id, llm_raw, llm_calls, llm_prompt FROM decisions
         WHERE llm_raw IS NOT NULL OR llm_calls IS NOT NULL OR llm_prompt IS NOT NULL`)
       for (const col of ['llm_raw', 'llm_calls', 'llm_prompt']) this.db.exec(`ALTER TABLE decisions DROP COLUMN ${col}`)
-      this.setMeta('schema_version', SCHEMA_VERSION)
     })
     this.db.exec('VACUUM')
+  }
+
+  /**
+   * 第 4 版：模型成本单价、赛季的提示词/引擎版本、LLM 重试/429/超时统计。
+   * 旧赛季没有版本记录，统一标成 legacy，页面会提示“中途升级过”。
+   */
+  private migrateV4(): void {
+    this.transaction(() => {
+      const columns = (table: string) => new Set((this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(c => c.name))
+      const add = (table: string, column: string, definition: string) => {
+        if (!columns(table).has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
+      }
+      add('agents', 'input_price_per_m', 'REAL')
+      add('agents', 'output_price_per_m', 'REAL')
+      add('seasons', 'prompt_version', `TEXT NOT NULL DEFAULT ''`)
+      add('seasons', 'engine_version', `TEXT NOT NULL DEFAULT ''`)
+      add('decisions', 'llm_retries', 'INTEGER NOT NULL DEFAULT 0')
+      add('decisions', 'llm_http_429', 'INTEGER NOT NULL DEFAULT 0')
+      add('decisions', 'llm_timeouts', 'INTEGER NOT NULL DEFAULT 0')
+      this.db.exec(`UPDATE seasons SET prompt_version = 'legacy' WHERE prompt_version = ''`)
+      this.db.exec(`UPDATE seasons SET engine_version = 'legacy' WHERE engine_version = ''`)
+    })
   }
 
   close(): void {
@@ -549,17 +603,19 @@ export class Store {
   }
 
   insertAgent(a: { kind: AgentKind, name: string, color: string } & Partial<Omit<AgentInput, 'name' | 'color'>>, now: Date): number {
-    const r = this.db.prepare(`INSERT INTO agents (kind, name, color, provider_id, model, reasoning_effort, timeout_seconds, extra_params, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    const r = this.db.prepare(`INSERT INTO agents (kind, name, color, provider_id, model, reasoning_effort, timeout_seconds, extra_params, input_price_per_m, output_price_per_m, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       a.kind, a.name, a.color, a.providerId ?? null, a.model ?? null, a.reasoningEffort ?? null,
-      a.timeoutSeconds ?? null, a.extraParams ? JSON.stringify(a.extraParams) : null, now.toISOString()
+      a.timeoutSeconds ?? null, a.extraParams ? JSON.stringify(a.extraParams) : null,
+      a.inputPricePerM ?? null, a.outputPricePerM ?? null, now.toISOString()
     )
     return Number(r.lastInsertRowid)
   }
 
   updateAgent(id: number, a: AgentUpdate): void {
-    this.db.prepare('UPDATE agents SET name = ?, color = ?, timeout_seconds = CASE WHEN kind = \'llm\' THEN ? ELSE timeout_seconds END WHERE id = ?')
-      .run(a.name, a.color, a.timeoutSeconds, id)
+    this.db.prepare(`UPDATE agents SET name = ?, color = ?, timeout_seconds = CASE WHEN kind = 'llm' THEN ? ELSE timeout_seconds END,
+      input_price_per_m = ?, output_price_per_m = ? WHERE id = ?`)
+      .run(a.name, a.color, a.timeoutSeconds, a.inputPricePerM, a.outputPricePerM, id)
   }
 
   setAgentStatus(id: number, status: AgentRow['status'], now: Date): void {
@@ -594,14 +650,18 @@ export class Store {
     return (this.db.prepare('SELECT * FROM seasons ORDER BY id DESC').all() as Row[]).map(toSeason)
   }
 
-  /** 结束当前赛季（如果有），开始新赛季，所有参赛中的模型自动加入。 */
-  startSeason(name: string, config: SeasonConfig, now: Date): SeasonRow {
+  /**
+   * 结束当前赛季（如果有），开始新赛季，所有未归档的模型自动加入。
+   * paused 的模型也加入，恢复后可以继续参赛；是否实际运行由引擎按 status 过滤。
+   */
+  startSeason(name: string, config: SeasonConfig, now: Date, versions: { promptVersion?: string, engineVersion?: string } = {}): SeasonRow {
     return this.transaction(() => {
       const at = now.toISOString()
       this.db.prepare('UPDATE seasons SET ended_at = ? WHERE ended_at IS NULL').run(at)
-      const r = this.db.prepare('INSERT INTO seasons (name, config, started_at) VALUES (?, ?, ?)').run(name, JSON.stringify(config), at)
+      const r = this.db.prepare('INSERT INTO seasons (name, config, prompt_version, engine_version, started_at) VALUES (?, ?, ?, ?, ?)')
+        .run(name, JSON.stringify(config), versions.promptVersion ?? '', versions.engineVersion ?? '', at)
       const id = Number(r.lastInsertRowid)
-      for (const agent of this.listAgents().filter(a => a.status === 'active')) this.addEntry(id, agent.id, now)
+      for (const agent of this.listAgents().filter(a => a.status !== 'archived')) this.addEntry(id, agent.id, now)
       return this.getSeason(id)!
     })
   }
@@ -683,7 +743,7 @@ export class Store {
    * 资产曲线：赛季里 since 之后的行情快照，点数超过 maxPoints 时等间隔抽样（保留最后一个点），
    * 带上每个快照里各模型的资产总值。返回抽样步长，前端据此判断断档。
    */
-  equitySeries(seasonId: number, sinceIso: string, maxPoints: number): { step: number, points: Array<{ t: string, price: string, values: Record<string, string> }> } {
+  equitySeries(seasonId: number, sinceIso: string, maxPoints: number): { step: number, points: Array<{ t: string, price: string, values: Record<string, string>, bases: Record<string, string> }> } {
     const { n } = this.db.prepare('SELECT COUNT(*) AS n FROM ticks WHERE season_id = ? AND at >= ? AND price IS NOT NULL').get(seasonId, sinceIso) as { n: number }
     const step = Math.max(1, Math.ceil(n / maxPoints))
     const rows = this.db.prepare(`
@@ -691,16 +751,19 @@ export class Store {
         SELECT id, at, price, ROW_NUMBER() OVER (ORDER BY id) - 1 AS rn FROM ticks
         WHERE season_id = ? AND at >= ? AND price IS NOT NULL
       ), picked AS (SELECT id, at, price FROM numbered WHERE rn % ? = 0 OR rn = ? - 1)
-      SELECT p.id, p.at, p.price, e.agent_id, e.total FROM picked p LEFT JOIN equity e ON e.tick_id = p.id ORDER BY p.id
-    `).all(seasonId, sinceIso, step, n) as Array<{ id: number, at: string, price: string, agent_id: number | null, total: string | null }>
-    const points: Array<{ t: string, price: string, values: Record<string, string> }> = []
+      SELECT p.id, p.at, p.price, e.agent_id, e.base, e.total FROM picked p LEFT JOIN equity e ON e.tick_id = p.id ORDER BY p.id
+    `).all(seasonId, sinceIso, step, n) as Array<{ id: number, at: string, price: string, agent_id: number | null, base: string | null, total: string | null }>
+    const points: Array<{ t: string, price: string, values: Record<string, string>, bases: Record<string, string> }> = []
     let lastId: number | null = null
     for (const r of rows) {
       if (r.id !== lastId) {
-        points.push({ t: r.at, price: r.price, values: {} })
+        points.push({ t: r.at, price: r.price, values: {}, bases: {} })
         lastId = r.id
       }
-      if (r.agent_id !== null && r.total !== null) points.at(-1)!.values[r.agent_id] = r.total
+      if (r.agent_id !== null && r.total !== null) {
+        points.at(-1)!.values[r.agent_id] = r.total
+        if (r.base !== null) points.at(-1)!.bases[r.agent_id] = r.base
+      }
     }
     return { step, points }
   }
@@ -786,13 +849,19 @@ export class Store {
         SUM(outcome = 'filled' AND order_side = 'sell') AS sells,
         SUM(outcome = 'filled' AND order_side = 'sell' AND CAST(realized_pnl AS REAL) > 0) AS wins,
         TOTAL(CASE WHEN outcome = 'filled' THEN CAST(fee_usdt AS REAL) END) AS fees,
+        TOTAL(CASE WHEN outcome = 'filled' THEN CAST(realized_pnl AS REAL) END) AS realized_pnl,
+        TOTAL(CASE WHEN outcome = 'filled' AND order_side = 'sell' AND CAST(realized_pnl AS REAL) > 0 THEN CAST(realized_pnl AS REAL) END) AS gross_profit,
+        TOTAL(CASE WHEN outcome = 'filled' AND order_side = 'sell' AND CAST(realized_pnl AS REAL) <= 0 THEN CAST(realized_pnl AS REAL) END) AS gross_loss,
         SUM(llm_status IS NOT NULL) AS asked,
         SUM(llm_status = 'ok') AS ok,
         SUM(llm_status = 'invalid_output') AS invalid,
         SUM(llm_status = 'request_failed') AS failed,
         AVG(CASE WHEN llm_status != 'request_failed' THEN llm_duration_ms END) AS avg_ms,
         TOTAL(llm_prompt_tokens) AS prompt_tokens,
-        TOTAL(llm_completion_tokens) AS completion_tokens
+        TOTAL(llm_completion_tokens) AS completion_tokens,
+        TOTAL(llm_retries) AS retries,
+        TOTAL(llm_http_429) AS http_429,
+        TOTAL(llm_timeouts) AS timeouts
       FROM decisions WHERE season_id = ? GROUP BY agent_id
     `).all(seasonId) as Array<Record<string, number | null>>
     return new Map(rows.map(r => [Number(r.agent_id), {
@@ -801,13 +870,107 @@ export class Store {
       sells: Number(r.sells ?? 0),
       wins: Number(r.wins ?? 0),
       fees: Number(r.fees ?? 0),
+      realizedPnl: Number(r.realized_pnl ?? 0),
+      grossProfit: Number(r.gross_profit ?? 0),
+      grossLoss: Number(r.gross_loss ?? 0),
       llmAsked: Number(r.asked ?? 0),
       llmOk: Number(r.ok ?? 0),
       llmInvalid: Number(r.invalid ?? 0),
       llmFailed: Number(r.failed ?? 0),
       llmAvgDurationMs: r.avg_ms === null ? null : Math.round(Number(r.avg_ms)),
       llmPromptTokens: Number(r.prompt_tokens ?? 0),
-      llmCompletionTokens: Number(r.completion_tokens ?? 0)
+      llmCompletionTokens: Number(r.completion_tokens ?? 0),
+      llmRetries: Number(r.retries ?? 0),
+      llmHttp429: Number(r.http_429 ?? 0),
+      llmTimeouts: Number(r.timeouts ?? 0)
     }]))
+  }
+
+  /** 每个模型 LLM 耗时的 p50 / p95 / 最大值（只统计有耗时的询问，含重试的总耗时） */
+  llmLatency(seasonId: number): Map<number, { p50: number, p95: number, max: number }> {
+    const rows = this.db.prepare(`SELECT agent_id, llm_duration_ms FROM decisions
+      WHERE season_id = ? AND llm_duration_ms IS NOT NULL ORDER BY agent_id, llm_duration_ms`).all(seasonId) as Array<{ agent_id: number, llm_duration_ms: number }>
+    const byAgent = new Map<number, number[]>()
+    for (const r of rows) {
+      const list = byAgent.get(Number(r.agent_id)) ?? []
+      list.push(Number(r.llm_duration_ms))
+      byAgent.set(Number(r.agent_id), list)
+    }
+    const pick = (list: number[], p: number) => list[Math.min(list.length - 1, Math.floor(list.length * p))]!
+    return new Map([...byAgent].map(([id, list]) => [id, { p50: pick(list, 0.5), p95: pick(list, 0.95), max: list.at(-1)! }]))
+  }
+
+  /** 每个模型在赛季里的平均持币市值占比，按每轮资产快照计算 */
+  exposureStats(seasonId: number): Map<number, number> {
+    const rows = this.db.prepare(`
+      SELECT e.agent_id,
+        AVG(CASE WHEN CAST(e.total AS REAL) > 0 THEN CAST(e.base AS REAL) * CAST(t.price AS REAL) / CAST(e.total AS REAL) * 100 END) AS avg
+      FROM equity e JOIN ticks t ON t.id = e.tick_id
+      WHERE t.season_id = ? GROUP BY e.agent_id
+    `).all(seasonId) as Array<{ agent_id: number, avg: number | null }>
+    return new Map(rows.filter(r => r.avg !== null).map(r => [Number(r.agent_id), Number(r.avg)]))
+  }
+
+  /** 每轮收益率的均值和波动：用于判断排名差异是否只是噪声 */
+  returnStats(seasonId: number): Map<number, { tStat: number | null, periodVolPct: number | null }> {
+    const rows = this.db.prepare(`
+      WITH r AS (
+        SELECT e.agent_id, CAST(e.total AS REAL) AS total,
+          LAG(CAST(e.total AS REAL)) OVER (PARTITION BY e.agent_id ORDER BY e.tick_id) AS prev
+        FROM equity e JOIN ticks t ON t.id = e.tick_id WHERE t.season_id = ?
+      )
+      SELECT agent_id, COUNT(*) AS n, AVG(total / prev - 1) AS mean,
+        AVG((total / prev - 1) * (total / prev - 1)) AS mean_sq
+      FROM r WHERE prev IS NOT NULL AND prev > 0 GROUP BY agent_id
+    `).all(seasonId) as Array<{ agent_id: number, n: number, mean: number | null, mean_sq: number | null }>
+    return new Map(rows.map((r) => {
+      const n = Number(r.n)
+      const mean = Number(r.mean ?? 0)
+      const variance = Math.max(0, Number(r.mean_sq ?? 0) - mean * mean)
+      const sd = Math.sqrt(variance)
+      return [Number(r.agent_id), {
+        tStat: n > 1 && sd > 0 ? mean / sd * Math.sqrt(n) : null,
+        periodVolPct: n > 1 ? sd * Math.sqrt(n) * 100 : null
+      }]
+    }))
+  }
+
+  /** 赛季的轮数、决策数和成交数，用来说明样本量 */
+  seasonSample(seasonId: number): { rounds: number, decisions: number, trades: number } {
+    const rounds = Number((this.db.prepare('SELECT COUNT(*) AS n FROM ticks WHERE season_id = ? AND price IS NOT NULL').get(seasonId) as { n: number }).n)
+    const decisions = Number((this.db.prepare('SELECT COUNT(*) AS n FROM decisions WHERE season_id = ?').get(seasonId) as { n: number }).n)
+    const trades = Number((this.db.prepare(`SELECT COUNT(*) AS n FROM decisions WHERE season_id = ? AND outcome = 'filled'`).get(seasonId) as { n: number }).n)
+    return { rounds, decisions, trades }
+  }
+
+  /** 每个模型最近一次被询问的时间 */
+  lastLlmAsked(seasonId: number): Map<number, string> {
+    const rows = this.db.prepare(`SELECT agent_id, MAX(created_at) AS at FROM decisions
+      WHERE season_id = ? AND llm_status IS NOT NULL GROUP BY agent_id`).all(seasonId) as Array<{ agent_id: number, at: string }>
+    return new Map(rows.map(r => [Number(r.agent_id), String(r.at)]))
+  }
+
+  /** 每个模型最近一次 LLM 错误（最终失败或重试后成功都会记录 error 的只有前者） */
+  lastLlmErrors(seasonId: number): Map<number, { at: string, error: string }> {
+    const rows = this.db.prepare(`SELECT agent_id, created_at, error FROM decisions
+      WHERE season_id = ? AND error IS NOT NULL ORDER BY created_at DESC`).all(seasonId) as Array<{ agent_id: number, created_at: string, error: string }>
+    const map = new Map<number, { at: string, error: string }>()
+    for (const r of rows) if (!map.has(Number(r.agent_id))) map.set(Number(r.agent_id), { at: String(r.created_at), error: String(r.error) })
+    return map
+  }
+
+  /** 赛季里的全部成交，按时间正序，用来在曲线上画买卖点 */
+  listFills(seasonId: number): Array<{ t: string, agentId: number, side: 'buy' | 'sell', price: string, qty: string, quote: string, realizedPnl: string | null }> {
+    const rows = this.db.prepare(`SELECT created_at, agent_id, order_side, price, filled_qty, filled_quote, realized_pnl
+      FROM decisions WHERE season_id = ? AND outcome = 'filled' ORDER BY created_at, rowid`).all(seasonId) as Row[]
+    return rows.map(r => ({
+      t: String(r.created_at),
+      agentId: Number(r.agent_id),
+      side: r.order_side === 'buy' ? 'buy' : 'sell',
+      price: String(r.price),
+      qty: String(r.filled_qty),
+      quote: String(r.filled_quote),
+      realizedPnl: str(r.realized_pnl)
+    }))
   }
 }

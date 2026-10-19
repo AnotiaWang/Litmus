@@ -28,9 +28,9 @@ import { BASELINE_PARAMS, checkStop, closedKlines, evaluate, marketStats, stopLi
 
 /** 每轮取的已收盘 K 线根数（均线基线需要 SMA50 + 确认根数，LLM 最多发 100 根） */
 export const KLINE_LIMIT = 100
-/** 发给 LLM 的它自己最近的决策条数、最近成交笔数 */
-const LLM_RECENT_DECISIONS = 10
-const LLM_RECENT_FILLS = 5
+/** 发给 LLM 的它自己最近的决策条数、最近成交笔数（只保留关键信息，避免重复观望理由锚定） */
+const LLM_RECENT_DECISIONS = 3
+const LLM_RECENT_FILLS = 3
 /** 发给 LLM 的日线根数 */
 export const DAILY_KLINES = 14
 
@@ -115,12 +115,24 @@ export function buildDecideInput(p: {
   equity: Decimal
   position: Position | null
   blocked: DecideInput['blocked']
+  riskState: DecideInput['riskState']
+  accounting: DecideInput['accounting']
   recentDecisions: DecisionSummary[]
   recentFills: DecisionSummary[]
 }): DecideInput {
   const { config, ledger, price, position } = p
   const entryPrice = position ? position.cost.div(ledger.base) : null
   const stopNow = position ? stopLine(config.risk, entryPrice!.toNumber(), position.peak.toNumber()) : null
+  const stats = marketStats(p.klines)
+  const stopPrice = stopNow ? new Decimal(stopNow.price) : null
+  const stopDistance = stopPrice ? price.minus(stopPrice) : null
+  const stopDistancePct = stopDistance && stopDistance.gt(0) ? stopDistance.div(price).mul(100).toFixed(2) : null
+  const stopDistanceAtr = stopDistance && stopDistance.gt(0) && Number.isFinite(stats.atr) && stats.atr > 0
+    ? stopDistance.div(stats.atr).toFixed(1)
+    : null
+  const holdingHours = position?.openedAt
+    ? Math.max(0, (p.now.getTime() - new Date(position.openedAt).getTime()) / 3_600_000)
+    : null
   return {
     symbol: config.symbol,
     baseAsset: p.rules.baseAsset,
@@ -130,14 +142,18 @@ export function buildDecideInput(p: {
     price: price.toFixed(),
     klines: p.klines.slice(-config.llmKlines),
     dailyKlines: p.dailyKlines,
-    stats: marketStats(p.klines),
+    stats,
     ledger: { usdt: ledger.usdt.toFixed(2), base: ledger.base.toFixed(), positionValue: ledger.base.mul(price).toFixed(2), equity: p.equity.toFixed(2) },
     position: position && entryPrice
       ? {
           entryPrice: entryPrice.toSignificantDigits(10).toFixed(),
           pnlPct: price.minus(entryPrice).div(entryPrice).mul(100).toFixed(2),
           peakPrice: position.peak.toFixed(),
-          stopPrice: stopNow ? new Decimal(stopNow.price).toSignificantDigits(10).toFixed() : null
+          stopPrice: stopPrice ? stopPrice.toSignificantDigits(10).toFixed() : null,
+          unrealizedPnl: ledger.base.mul(price).minus(position.cost).toFixed(2),
+          holdingHours,
+          stopDistancePct,
+          stopDistanceAtr
         }
       : null,
     stopRules: { stopLossPct: config.risk.stopLossPct, trailingStopPct: config.risk.trailingStopPct },
@@ -145,9 +161,14 @@ export function buildDecideInput(p: {
       maxBuyUsdt: maxBuyUsdt({ ledger, price, limits: config.risk }).toDecimalPlaces(2, Decimal.ROUND_DOWN).toFixed(2),
       maxOrderPct: config.risk.maxOrderPct,
       minOrderUsdt: p.rules.minNotional.toFixed(),
-      maxPositionPct: config.risk.maxPositionPct
+      maxPositionPct: config.risk.maxPositionPct,
+      maxTradesPerDay: config.risk.maxTradesPerDay,
+      cooldownMinutes: config.risk.cooldownMinutes,
+      dailyLossLimitPct: config.risk.dailyLossLimitPct
     },
     blocked: p.blocked,
+    riskState: p.riskState,
+    accounting: p.accounting,
     recentDecisions: [...p.recentDecisions].reverse().map(r => ({
       time: r.createdAt,
       price: r.price,
@@ -161,7 +182,8 @@ export function buildDecideInput(p: {
       side: r.orderSide === 'buy' ? 'buy' : 'sell',
       price: r.price,
       qty: r.filledQty,
-      quote: r.filledQuote
+      quote: r.filledQuote,
+      realizedPnl: r.realizedPnl
     }))
   }
 }
@@ -405,9 +427,16 @@ export class Engine {
     if (ctx.trigger === 'schedule' && state.getLlmSlot() === slot.key) return 'hold'
 
     // 先看买、卖还能不能做：都不能就不浪费一次 LLM 调用，也不算问过，限制解除后下一轮就会问
-    const buyBlocked = precheck(this.riskInput(ctx, 'buy'))?.reason ?? null
+    const riskInput = this.riskInput(ctx, 'buy')
+    const buyBlocked = precheck(riskInput)?.reason ?? null
     const sellBlocked = hasPosition ? precheck(this.riskInput(ctx, 'sell'))?.reason ?? null : '空仓，没有可卖的币'
     if (buyBlocked && sellBlocked) return 'hold'
+
+    const lastTradeAt = this.deps.store.lastFillAt(ctx.season.id, agent.id)
+    const cooldownRemainingMinutes = lastTradeAt && config.risk.cooldownMinutes > 0
+      ? Math.max(0, Math.ceil(config.risk.cooldownMinutes - (now.getTime() - lastTradeAt.getTime()) / 60_000))
+      : 0
+    const accounting = this.deps.store.entryStats(ctx.season.id).get(agent.id)
 
     const input = buildDecideInput({
       config,
@@ -420,6 +449,15 @@ export class Engine {
       equity: ctx.equity,
       position,
       blocked: { buy: buyBlocked, sell: sellBlocked },
+      riskState: {
+        tradesToday: riskInput.tradesToday,
+        cooldownRemainingMinutes,
+        circuit: ctx.circuit?.reason ?? null
+      },
+      accounting: {
+        realizedPnl: (accounting?.realizedPnl ?? 0).toFixed(2),
+        fees: (accounting?.fees ?? 0).toFixed(2)
+      },
       recentDecisions: this.deps.store.recentLlmDecisions(ctx.season.id, agent.id, LLM_RECENT_DECISIONS),
       recentFills: this.deps.store.recentFills(ctx.season.id, agent.id, LLM_RECENT_FILLS)
     })
@@ -427,6 +465,9 @@ export class Engine {
     ctx.record = true
     const result = await this.deps.deciderFor(agent).decide(input)
     const usage = summarizeCalls(result.calls)
+    const retries = Math.max(0, result.calls.length - 1)
+    const http429 = result.calls.filter(c => c.httpStatus === 429).length
+    const timeouts = result.calls.filter(c => c.error && /超时|Timeout/i.test(c.error)).length
     Object.assign(d, {
       signal: result.action,
       signalNote: result.status === 'ok' ? null : `LLM 没有给出合法结果，程序代为观望，下次在 ${fmtUtc(slot.next)} 之前的每一轮都会重试`,
@@ -442,6 +483,9 @@ export class Engine {
       llmDurationMs: usage.durationMs,
       llmPromptTokens: usage.promptTokens,
       llmCompletionTokens: usage.completionTokens,
+      llmRetries: retries,
+      llmHttp429: http429,
+      llmTimeouts: timeouts,
       error: result.error ? redact(result.error) : null
     } satisfies Partial<Decision>)
     if (result.status === 'ok') state.setLlmSlot(slot.key)
@@ -502,7 +546,7 @@ export class Engine {
       return 'risk_block'
     }
     const after = applyFill(ledger, side, fill)
-    const { position, realizedPnl } = updatePosition(ctx.position, side, fill, ledger, after, price, rules)
+    const { position, realizedPnl } = updatePosition(ctx.position, side, fill, ledger, after, price, rules, ctx.now)
     ctx.ledger = after
     ctx.position = position
     ctx.filled = true
@@ -555,6 +599,9 @@ export class Engine {
       llmDurationMs: null,
       llmPromptTokens: null,
       llmCompletionTokens: null,
+      llmRetries: 0,
+      llmHttp429: 0,
+      llmTimeouts: 0,
       riskPassed: null,
       riskRule: null,
       riskReason: null,

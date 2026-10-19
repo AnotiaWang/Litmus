@@ -49,6 +49,9 @@ function excessText(value: string | null): string {
           · 止损价 {{ fmtPrice(standing.stopPrice) }}
         </template>
       </p>
+      <p class="mt-1 text-xs text-muted">
+        平均仓位 {{ standing.avgExposurePct === null ? '-' : `${fmtNumber(standing.avgExposurePct, 0)}%` }}
+      </p>
     </UCard>
     <UCard>
       <p class="text-sm text-muted">
@@ -72,6 +75,10 @@ function excessText(value: string | null): string {
       <p class="mt-1 text-xs text-muted">
         自 {{ fmtDateTime(standing.startedAt) }}（{{ fmtPrice(standing.startPrice) }}）
       </p>
+      <p class="mt-1 text-xs text-muted">
+        期间波动 {{ standing.periodVolPct === null ? '-' : `${fmtNumber(standing.periodVolPct)}%` }}
+        · t 值 {{ standing.returnTStat === null ? '-' : fmtNumber(standing.returnTStat, 2) }}
+      </p>
     </UCard>
     <UCard>
       <p class="text-sm text-muted">
@@ -93,7 +100,10 @@ function excessText(value: string | null): string {
         </template>
       </p>
       <p class="mt-1 text-xs text-muted">
-        手续费合计 {{ fmtNumber(standing.feesUsdt) }} USDT
+        已实现 {{ fmtNumber(standing.realizedPnl) }} · 浮动 {{ standing.unrealizedPnl === null ? '-' : fmtNumber(standing.unrealizedPnl) }} USDT
+      </p>
+      <p class="mt-1 text-xs text-muted">
+        手续费 {{ fmtNumber(standing.feesUsdt) }} USDT · 盈亏比 {{ standing.profitFactor === null ? '-' : fmtNumber(standing.profitFactor) }}
       </p>
     </UCard>
     <UCard v-if="llm">
@@ -107,10 +117,16 @@ function excessText(value: string | null): string {
         <span class="text-sm font-normal text-muted">{{ llm.ok }} / {{ answered(llm) }} 次</span>
       </p>
       <p class="mt-2 text-xs text-muted">
-        输出不合格 {{ llm.invalidOutput }} 次 · 请求失败 {{ llm.requestFailed }} 次
+        输出不合格 {{ llm.invalidOutput }} 次 · 请求失败 {{ llm.requestFailed }} 次 · 重试 {{ llm.retries }} 次
       </p>
       <p class="mt-1 text-xs text-muted">
-        平均耗时 {{ fmtDuration(llm.avgDurationMs) }} · token 输入 {{ fmtCompact(llm.promptTokens) }} / 输出 {{ fmtCompact(llm.completionTokens) }}
+        平均 {{ fmtDuration(llm.avgDurationMs) }} · p95 {{ fmtDuration(llm.p95DurationMs) }} · 429 {{ llm.http429 }} / 超时 {{ llm.timeouts }}
+      </p>
+      <p class="mt-1 text-xs text-muted">
+        token 输入 {{ fmtCompact(llm.promptTokens) }} / 输出 {{ fmtCompact(llm.completionTokens) }}
+        <template v-if="llm.costUsd !== null">
+          · 估算成本 ${{ fmtNumber(llm.costUsd, 2) }}
+        </template>
       </p>
     </UCard>
     <UCard v-else>

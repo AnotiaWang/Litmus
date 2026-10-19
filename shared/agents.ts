@@ -47,14 +47,19 @@ export const agentInputSchema = z.object({
   reasoningEffort: z.string().trim().regex(/^[a-z]*$/, '只能是小写英文单词，如 low、medium、high').nullable().default(null).transform(v => v || null),
   /** 单次请求最多等多少秒，超时重试 1 次 */
   timeoutSeconds: z.coerce.number().int('必须是整数').min(5, '不能小于 5').max(600, '不能大于 600').default(120),
+  /** 可选的 token 单价（每百万 token，美元），只用于面板估算成本，不影响交易 */
+  inputPricePerM: z.preprocess(v => v === '' || v === null || v === undefined ? null : v, z.coerce.number().min(0, '不能小于 0').max(100000, '数值过大').nullable().default(null)),
+  outputPricePerM: z.preprocess(v => v === '' || v === null || v === undefined ? null : v, z.coerce.number().min(0, '不能小于 0').max(100000, '数值过大').nullable().default(null)),
   extraParams
 })
 export type AgentInput = z.output<typeof agentInputSchema>
 
-/** 修改模型：只能改显示名、颜色和超时 */
+/** 修改模型：只能改显示名、颜色、超时和成本单价 */
 export const agentUpdateSchema = z.object({
   name,
   color,
-  timeoutSeconds: agentInputSchema.shape.timeoutSeconds
+  timeoutSeconds: agentInputSchema.shape.timeoutSeconds,
+  inputPricePerM: agentInputSchema.shape.inputPricePerM,
+  outputPricePerM: agentInputSchema.shape.outputPricePerM
 })
 export type AgentUpdate = z.output<typeof agentUpdateSchema>

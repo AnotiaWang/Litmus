@@ -25,6 +25,8 @@ export interface Position {
   cost: Decimal
   /** 持仓以来的最高价（移动止损用） */
   peak: Decimal
+  /** 本轮持仓第一次建仓的时间（ISO）；老数据可能没有 */
+  openedAt?: string
 }
 
 export interface Fill {
@@ -72,16 +74,19 @@ export function updatePosition(
   before: Ledger,
   after: Ledger,
   price: Decimal,
-  rules: SymbolRules
+  rules: SymbolRules,
+  now?: Date
 ): { position: Position | null, realizedPnl: Decimal | null } {
   if (side === 'buy') {
     const spent = fill.quote.plus(fill.fee)
-    const position = pos ? { cost: pos.cost.plus(spent), peak: Decimal.max(pos.peak, price) } : { cost: spent, peak: price }
+    const position = pos
+      ? { cost: pos.cost.plus(spent), peak: Decimal.max(pos.peak, price), openedAt: pos.openedAt }
+      : { cost: spent, peak: price, openedAt: now?.toISOString() }
     return { position: isPosition(after.base, price, rules) ? position : null, realizedPnl: null }
   }
   if (!pos || before.base.lte(0)) return { position: null, realizedPnl: null }
   const remaining = pos.cost.mul(after.base).div(before.base)
   const realizedPnl = fill.quote.minus(fill.fee).minus(pos.cost.minus(remaining))
-  const position = isPosition(after.base, price, rules) ? { cost: remaining, peak: pos.peak } : null
+  const position = isPosition(after.base, price, rules) ? { cost: remaining, peak: pos.peak, openedAt: pos.openedAt } : null
   return { position, realizedPnl }
 }

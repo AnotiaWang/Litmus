@@ -4,6 +4,7 @@ const { isAdmin, logout } = useApi()
 
 const links = computed(() => [
   { label: '排行榜', icon: 'i-lucide-trophy', to: '/', active: route.path === '/' || route.path.startsWith('/agents/') },
+  { label: '方法', icon: 'i-lucide-book-open', to: '/methodology', active: route.path === '/methodology' },
   { label: '管理', icon: 'i-lucide-settings', to: '/admin', active: route.path === '/admin' }
 ])
 </script>

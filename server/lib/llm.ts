@@ -44,6 +44,12 @@ const fmtNum = (n: number) => Number.isFinite(n) ? new Decimal(n).toSignificantD
 const fmtPct = (n: number) => `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
 /** USDT 金额保留两位小数 */
 const fmtUsdt = (v: string | null) => v ? new Decimal(v).toFixed(2) : '-'
+/** 带正负号的 USDT 金额，用于盈亏 */
+const fmtSignedUsdt = (v: string | null) => {
+  if (v === null || v === '') return '-'
+  const n = new Decimal(v)
+  return `${n.gt(0) ? '+' : ''}${n.toFixed(2)}`
+}
 
 /** 一根 K 线一行：时间 开 高 低 收 成交量（列名写在表头，不在每行重复） */
 function klineLines(klines: Kline[], time: (t: number) => string): string {
@@ -93,14 +99,30 @@ export interface DecideInput extends MarketInput {
   price: string
   ledger: { usdt: string, base: string, positionValue: string, equity: string }
   /** 空仓时为 null */
-  position: { entryPrice: string, pnlPct: string, peakPrice: string, stopPrice: string | null } | null
+  position: {
+    entryPrice: string
+    pnlPct: string
+    peakPrice: string
+    stopPrice: string | null
+    /** 当前持仓的浮动盈亏（USDT，未扣卖出时的手续费） */
+    unrealizedPnl: string
+    /** 持仓时长（小时）；老数据没有记录开仓时间时为 null */
+    holdingHours: number | null
+    /** 距止损线的百分比和 ATR 倍数；止损关闭时为 null */
+    stopDistancePct: string | null
+    stopDistanceAtr: string | null
+  } | null
   stopRules: Pick<StrategyParams, 'stopLossPct' | 'trailingStopPct'>
   /** maxBuyUsdt：单笔上限、可用 USDT、仓位上限三者取最小后，现在最多能买多少；minOrderUsdt：交易所最小下单额 */
-  limits: { maxBuyUsdt: string, maxOrderPct: number, minOrderUsdt: string, maxPositionPct: number }
+  limits: { maxBuyUsdt: string, maxOrderPct: number, minOrderUsdt: string, maxPositionPct: number, maxTradesPerDay: number, cooldownMinutes: number, dailyLossLimitPct: number }
   /** 现在不能买入 / 卖出的原因；可以时为 null */
   blocked: { buy: string | null, sell: string | null }
+  /** 当日风控使用情况：已成交笔数、冷却剩余分钟、熔断原因 */
+  riskState: { tradesToday: number, cooldownRemainingMinutes: number, circuit: string | null }
+  /** 本赛季累计已实现盈亏和手续费，帮助模型知道自己的交易成绩 */
+  accounting: { realizedPnl: string, fees: string }
   recentDecisions: Array<{ time: string, price: string | null, action: string, sizePct: number | null, outcome: string, reason: string | null }>
-  recentFills: Array<{ time: string, side: 'buy' | 'sell', price: string | null, qty: string | null, quote: string | null }>
+  recentFills: Array<{ time: string, side: 'buy' | 'sell', price: string | null, qty: string | null, quote: string | null, realizedPnl: string | null }>
 }
 
 export interface DecideResult {
@@ -127,12 +149,13 @@ export const DECIDE_SYSTEM_PROMPT = `你是一名加密货币现货交易员，�
 
 规则：
 1. 只做现货多头：买入是用 USDT 买币，卖出是把持有的币换回 USDT。不能做空，不能加杠杆。
-2. size_pct（0~100）：买入时表示动用账本可用 USDT 的比例；卖出时表示卖掉所持币的比例（100 为全部卖出）；观望填 0。
+2. size_pct（0~100）：买入时表示动用账本可用 USDT 的比例（不是总资产）；卖出时表示卖掉所持币的比例（100 为全部卖出）；观望填 0。
 3. 按本轮的当前价格成交，每笔收取 0.1% 手续费。
 4. 程序会在你的决定之上执行风控（单笔上限、仓位上限、每日次数、冷却时间、亏损熔断），风控只会调小金额或拦下交易。提示词里会写明现在哪些操作不可用。
 5. 程序每轮都会检查止损线，跌破时自动全部卖出；你也可以随时主动卖出。
 6. 每笔下单金额不能低于交易所最小下单额，比例太小时这笔不会下单；卖出后剩下的币低于最小下单额也卖不掉。
 7. 提示词里的行情摘要由程序算好，可以直接引用，不必自己从 K 线推算。
+8. 没有新的信息、或这次交易的理由并不充分时，观望是合理的选择；不要为了交易而交易。
 
 只输出一个 JSON 对象，不要输出其他文字。先写理由再给结论，格式如下：
 {"reason": "中文理由，100字以内，指出具体依据", "action": "buy" 或 "sell" 或 "hold", "size_pct": 0到100的数字, "confidence": 0到1的数字，表示你对这个判断的把握，0.5 表示拿不准}`
@@ -140,16 +163,25 @@ export const DECIDE_SYSTEM_PROMPT = `你是一名加密货币现货交易员，�
 export function buildDecidePrompt(input: DecideInput): string {
   const pos = input.position
   const positionText = pos
-    ? `持仓均价 ${pos.entryPrice}（含手续费），浮动盈亏 ${pos.pnlPct}%，持仓以来最高价 ${pos.peakPrice}，当前止损线 ${pos.stopPrice ?? '无（止损已关闭）'}`
+    ? [
+        `持仓均价 ${pos.entryPrice}（含手续费），浮动盈亏 ${pos.pnlPct}%（${fmtSignedUsdt(pos.unrealizedPnl)} USDT）`,
+        `持仓以来最高价 ${pos.peakPrice}，当前止损线 ${pos.stopPrice ?? '无（止损已关闭）'}`,
+        pos.stopDistancePct !== null && pos.stopDistanceAtr !== null ? `距止损 ${pos.stopDistancePct}%（约 ${pos.stopDistanceAtr} ATR）` : null,
+        pos.holdingHours !== null ? `已持有 ${pos.holdingHours.toFixed(1)} 小时` : null
+      ].filter(Boolean).join('，')
     : '空仓'
-  const can = (reason: string | null) => reason ? `不可以（${reason}）` : '可以'
+  const buyText = input.blocked.buy ? `不可买（${input.blocked.buy}）` : `可买，最多 ${input.limits.maxBuyUsdt} USDT`
+  const sellText = input.blocked.sell ? `不可卖（${input.blocked.sell}）` : `可卖 ${input.ledger.base} ${input.baseAsset}`
+  const remainingTrades = Math.max(0, input.limits.maxTradesPerDay - input.riskState.tradesToday)
   const recent = input.recentDecisions.length
     ? input.recentDecisions.map(d =>
         `${fmtShort(d.time)} 价格${trimOpt(d.price)} ${ACTION_LABELS[d.action as keyof typeof ACTION_LABELS] ?? d.action}${d.sizePct ? ` ${d.sizePct}%` : ''} 结果${OUTCOME_LABELS[d.outcome] ?? d.outcome} 理由：${d.reason ?? '-'}`
       ).join('\n')
     : '（暂无）'
   const fills = input.recentFills.length
-    ? input.recentFills.map(f => `${fmtShort(f.time)} ${ACTION_LABELS[f.side]} ${trimOpt(f.qty)} ${input.baseAsset}，金额 ${fmtUsdt(f.quote)} USDT，价格 ${trimOpt(f.price)}`).join('\n')
+    ? input.recentFills.map(f =>
+        `${fmtShort(f.time)} ${ACTION_LABELS[f.side]} ${trimOpt(f.qty)} ${input.baseAsset}，金额 ${fmtUsdt(f.quote)} USDT，价格 ${trimOpt(f.price)}${f.side === 'sell' && f.realizedPnl !== null ? `，已实现盈亏 ${fmtSignedUsdt(f.realizedPnl)} USDT` : ''}`
+      ).join('\n')
     : '（暂无）'
   return `交易对：${input.symbol}
 当前时间（UTC）：${fmtTime(input.now)}
@@ -159,16 +191,17 @@ export function buildDecidePrompt(input: DecideInput): string {
 账本：可用 ${input.ledger.usdt} USDT，持有 ${input.ledger.base} ${input.baseAsset}（市值 ${input.ledger.positionValue} USDT），总资产 ${input.ledger.equity} USDT
 持仓：${positionText}
 止损规则：${stopRulesText(input.stopRules)}
-风控限制：单笔买入不超过总资产的 ${input.limits.maxOrderPct}%，持币市值不超过总资产的 ${input.limits.maxPositionPct}%，每笔不能低于交易所最小下单额 ${input.limits.minOrderUsdt} USDT；算上可用 USDT，现在最多还能买入 ${input.limits.maxBuyUsdt} USDT
-现在能否买入：${can(input.blocked.buy)}
-现在能否卖出：${can(input.blocked.sell)}
+风控规则：单笔买入≤总资产的 ${input.limits.maxOrderPct}%，持币≤总资产的 ${input.limits.maxPositionPct}%，每日最多 ${input.limits.maxTradesPerDay} 笔，冷却 ${input.limits.cooldownMinutes} 分钟，当日亏损 ${input.limits.dailyLossLimitPct}% 熔断；最小下单额 ${input.limits.minOrderUsdt} USDT
+风控状态：今日已成交 ${input.riskState.tradesToday} 笔（剩余 ${remainingTrades} 笔），冷却剩余 ${input.riskState.cooldownRemainingMinutes} 分钟，${input.riskState.circuit ?? '未熔断'}
+本赛季：累计已实现盈亏 ${fmtSignedUsdt(input.accounting.realizedPnl)} USDT，累计手续费 ${fmtUsdt(input.accounting.fees)} USDT
+本轮可执行：${buyText}；${sellText}
 
 ${marketText(input)}
 
-你最近的决策：
+你最近的决策（从早到晚）：
 ${recent}
 
-最近的成交：
+最近的成交（从早到晚）：
 ${fills}
 
 请做出这次的决策。`
@@ -330,6 +363,8 @@ export class OpenAiLlm implements Decider {
         content = await this.complete(messages, calls)
       } catch (e) {
         errors.push((e as Error).message)
+        // 输出被截断时重试大概率还是截断，白白多花一次钱
+        if (/输出被截断/.test((e as Error).message)) break
         continue
       }
       raws.push(content)
@@ -338,6 +373,8 @@ export class OpenAiLlm implements Decider {
       } catch (e) {
         errors.push((e as Error).message)
         calls.at(-1)!.error = `输出不合格：${(e as Error).message}`
+        // 输出被截断时重试大概率还是截断，白白多花一次钱
+        if (/输出被截断/.test((e as Error).message)) break
       }
     }
     return { ok: false, error: `LLM 两次都没有给出合法结果：${errors.join('；')}`, raw: raws.length ? raws.join('\n---\n') : null, calls }
@@ -410,6 +447,8 @@ export class OpenAiLlm implements Decider {
     const { content, think } = splitThink(message.content)
     call.reasoning = clip(reasoningOf(message) ?? think)
     call.content = clip(content)
+    // 拿到了正文但被截断：算模型输出不合格，不算服务请求失败
+    if (call.finishReason === 'length') return fail('输出被截断（finish_reason=length），不再重试')
     return content
   }
 }

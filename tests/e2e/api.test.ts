@@ -61,7 +61,7 @@ describe('公开浏览与管理', async () => {
     const standings = await $fetch<StandingsResponse>('/api/standings')
     expect(standings).toMatchObject({ asOf: null, standings: [{ agent: { kind: 'baseline', name: '均线基线' }, equity: null }] })
     expect(await $fetch('/api/decisions')).toEqual({ items: [], total: 0 })
-    expect(await $fetch('/api/equity?days=7')).toEqual({ seasonId: seasons[0]!.id, points: [], startPrice: null, base: { price: null, values: {} }, intervalMs: 1440 * 60_000 })
+    expect(await $fetch('/api/equity?days=7')).toEqual({ seasonId: seasons[0]!.id, points: [], startPrice: null, base: { price: null, values: {} }, trades: [], intervalMs: 1440 * 60_000 })
     expect((await fetch('/api/decisions/not-exist')).status).toBe(404)
     expect((await fetch('/api/decisions?limit=999')).status).toBe(400)
     expect((await fetch('/api/standings?season=999')).status).toBe(404)
@@ -77,6 +77,7 @@ describe('公开浏览与管理', async () => {
     ['POST', '/api/admin/providers'],
     ['GET', '/api/admin/agents'],
     ['POST', '/api/admin/agents'],
+    ['GET', '/api/admin/health'],
     ['POST', '/api/admin/seasons'],
     ['PATCH', '/api/admin/seasons/1']
   ])('%s %s 未带口令返回 401', async (method, path) => {

@@ -53,12 +53,18 @@ const fmtClock = (d: Date) => d.toLocaleTimeString('zh-CN', { hour12: false })
         :standings="standings"
       />
 
+      <SampleNotice
+        :sample="standings.sample"
+        :standings="standings.standings"
+      />
+
       <ReturnChart
         v-if="equity"
         v-model:days="days"
         :points="equity.points"
         :start-price="equity.startPrice"
         :base="equity.base"
+        :trades="equity.trades"
         :interval-ms="equity.intervalMs"
         :capital="season.config.initialCapital"
         :agents="chartAgents"
@@ -70,8 +76,17 @@ const fmtClock = (d: Date) => d.toLocaleTimeString('zh-CN', { hour12: false })
         class="h-96 w-full"
       />
 
+      <RiskChart
+        v-if="equity"
+        v-model:days="days"
+        :points="equity.points"
+        :interval-ms="equity.intervalMs"
+        :agents="chartAgents"
+      />
+
       <LeaderboardTable
         :standings="standings.standings"
+        :sample="standings.sample"
         :loading="false"
         @select="openAgent"
       />
@@ -94,7 +109,7 @@ const fmtClock = (d: Date) => d.toLocaleTimeString('zh-CN', { hour12: false })
       />
 
       <p class="text-center text-xs text-muted">
-        所有交易都是模拟撮合，资金为虚拟资金。数据每 {{ REFRESH_MS / 1000 }} 秒自动刷新（页面在后台时暂停）<template v-if="lastUpdated">
+        所有交易都是模拟撮合，资金为虚拟资金。页面时间为本地时间；赛季日切、提示词和风控按 UTC。数据每 {{ REFRESH_MS / 1000 }} 秒自动刷新（页面在后台时暂停）<template v-if="lastUpdated">
           · 更新于 {{ fmtClock(lastUpdated) }}
         </template>
       </p>

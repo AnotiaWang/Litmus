@@ -80,7 +80,9 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
         <div class="flex flex-wrap items-center gap-2">
           <h2 class="font-semibold">
             {{ title ?? '决策记录' }}
-            <span class="ml-1 text-sm font-normal text-muted">共 {{ total }} 条</span>
+            <span class="ml-1 text-sm font-normal text-muted">
+              共 {{ total }} 条<template v-if="onlyActions">（已隐藏观望）</template>
+            </span>
           </h2>
           <UButton
             v-if="newCount > 0"
@@ -109,6 +111,11 @@ const fmtIndicator = (v: number | undefined) => v === undefined ? '-' : fmtPrice
       class="cursor-pointer"
       @select="(_e: Event, row: { toggleExpanded: () => void }) => row.toggleExpanded()"
     >
+      <template #createdAt-header>
+        <TermHint :text="'页面显示本地时间；行情快照、提示词和每日日切使用 UTC。'">
+          时间
+        </TermHint>
+      </template>
       <template #signal-header>
         <TermHint :text="GLOSSARY.action">
           动作

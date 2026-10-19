@@ -33,6 +33,8 @@ const state = reactive({
   color: AGENT_COLORS[0] as string,
   reasoningEffort: NO_EFFORT,
   timeoutSeconds: 120,
+  inputPricePerM: null as number | null,
+  outputPricePerM: null as number | null,
   extraParams: ''
 })
 /** 显示名是否手动改过；没改过就跟着模型名自动填 */
@@ -54,6 +56,8 @@ watch(open, (v) => {
     color: a?.color ?? AGENT_COLORS.find(c => !used.has(c)) ?? AGENT_COLORS[0],
     reasoningEffort: a?.reasoningEffort ?? NO_EFFORT,
     timeoutSeconds: a?.timeoutSeconds ?? 120,
+    inputPricePerM: a?.inputPricePerM ?? null,
+    outputPricePerM: a?.outputPricePerM ?? null,
     extraParams: a?.extraParams ? JSON.stringify(a.extraParams, null, 2) : ''
   })
   nameTouched.value = editing.value
@@ -102,7 +106,13 @@ function parseExtra(text: string): Record<string, unknown> | null | undefined {
 
 function body() {
   if (editing.value) {
-    return { name: state.name, color: state.color, timeoutSeconds: state.timeoutSeconds }
+    return {
+      name: state.name,
+      color: state.color,
+      timeoutSeconds: state.timeoutSeconds,
+      inputPricePerM: state.inputPricePerM,
+      outputPricePerM: state.outputPricePerM
+    }
   }
   return {
     providerId: state.providerId,
@@ -111,6 +121,8 @@ function body() {
     color: state.color,
     reasoningEffort: state.reasoningEffort === NO_EFFORT ? null : state.reasoningEffort,
     timeoutSeconds: state.timeoutSeconds,
+    inputPricePerM: state.inputPricePerM,
+    outputPricePerM: state.outputPricePerM,
     extraParams: parseExtra(state.extraParams)
   }
 }
@@ -286,6 +298,34 @@ async function save() {
               class="w-full"
             />
           </UFormField>
+          <div class="grid gap-4 sm:grid-cols-2">
+            <UFormField
+              name="inputPricePerM"
+              label="输入单价（USD / 百万 token）"
+              description="可选，只用于估算成本，不影响交易。留空则不估算。"
+            >
+              <UInputNumber
+                v-model="state.inputPricePerM"
+                :min="0"
+                :step="0.01"
+                placeholder="例如 3"
+                class="w-full"
+              />
+            </UFormField>
+            <UFormField
+              name="outputPricePerM"
+              label="输出单价（USD / 百万 token）"
+              description="可选，只用于估算成本，不影响交易。留空则不估算。"
+            >
+              <UInputNumber
+                v-model="state.outputPricePerM"
+                :min="0"
+                :step="0.01"
+                placeholder="例如 15"
+                class="w-full"
+              />
+            </UFormField>
+          </div>
           <UFormField
             v-if="!editing"
             name="extraParams"

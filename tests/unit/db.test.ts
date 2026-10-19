@@ -129,7 +129,8 @@ describe('决策记录', () => {
         ? [{ startedAt: NOW.toISOString(), durationMs: 10, model: 'm', responseModel: null, reasoningEffort: null, jsonMode: true, httpStatus: 200, finishReason: 'stop', reasoning: null, content: '{"action":"hold"}', usage: null, error: null }]
         : null,
       llmPrompt: details ? { system: '系统', user: '用户' } : null,
-      llmDurationMs: 10, llmPromptTokens: 1, llmCompletionTokens: 1, riskPassed: true, riskRule: null, riskReason: null,
+      llmDurationMs: 10, llmPromptTokens: 1, llmCompletionTokens: 1, llmRetries: 0, llmHttp429: 0, llmTimeouts: 0,
+      riskPassed: true, riskRule: null, riskReason: null,
       orderSide: null, orderQuoteAmount: null, orderQty: null, filledQty: null, filledQuote: null, feeUsdt: null, realizedPnl: null,
       outcome: 'hold', error: null
     }
@@ -173,7 +174,7 @@ describe('决策记录', () => {
     const store = new Store(path)
     const columns = (store.db.prepare('PRAGMA table_info(decisions)').all() as Array<{ name: string }>).map(c => c.name)
     expect(columns).not.toContain('llm_prompt')
-    expect(store.db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()).toEqual({ value: '3' })
+    expect(store.db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()).toEqual({ value: '4' })
     expect(store.getDecision('old')).toEqual(d)
     store.close()
     // 再次打开不会重复迁移

@@ -16,12 +16,14 @@ const input: DecideInput = {
   dailyKlines: [],
   stats: marketStats(klines),
   ledger: { usdt: '40.00', base: '0.001', positionValue: '60.00', equity: '100.00' },
-  position: { entryPrice: '58000', pnlPct: '3.45', peakPrice: '61000', stopPrice: '55100' },
+  position: { entryPrice: '58000', pnlPct: '3.45', peakPrice: '61000', stopPrice: '55100', unrealizedPnl: '2.00', holdingHours: 4, stopDistancePct: '8.17', stopDistanceAtr: '12.3' },
   stopRules: { stopLossPct: 5, trailingStopPct: 0 },
-  limits: { maxBuyUsdt: '20.00', maxOrderPct: 50, minOrderUsdt: '5', maxPositionPct: 80 },
+  limits: { maxBuyUsdt: '20.00', maxOrderPct: 50, minOrderUsdt: '5', maxPositionPct: 80, maxTradesPerDay: 6, cooldownMinutes: 60, dailyLossLimitPct: 5 },
   blocked: { buy: '交易冷却时间：距上一笔成交仅 10 分钟，需间隔 60 分钟', sell: null },
+  riskState: { tradesToday: 0, cooldownRemainingMinutes: 50, circuit: null },
+  accounting: { realizedPnl: '1.00', fees: '0.50' },
   recentDecisions: [{ time: '2026-10-08T08:00:00.000Z', price: '58000', action: 'buy', sizePct: 60, outcome: 'filled', reason: '趋势向上' }],
-  recentFills: [{ time: '2026-10-08T08:00:00.000Z', side: 'buy', price: '58000', qty: '0.001', quote: '58' }]
+  recentFills: [{ time: '2026-10-08T08:00:00.000Z', side: 'buy', price: '58000', qty: '0.001', quote: '58', realizedPnl: null }]
 }
 
 const ok = '{"reason":"趋势转强","action":"buy","size_pct":40,"confidence":0.7}'
@@ -52,12 +54,14 @@ describe('提示词', () => {
       '当前时间（UTC）：2026-10-08 12:00',
       '每根 4h K 线收盘后询问你一次',
       '可用 40.00 USDT，持有 0.001 BTC（市值 60.00 USDT），总资产 100.00 USDT',
-      '持仓均价 58000（含手续费），浮动盈亏 3.45%',
+      '持仓均价 58000（含手续费），浮动盈亏 3.45%（+2.00 USDT）',
       '当前止损线 55100',
       '跌破持仓均价 5% 止损，移动止损关闭',
-      '单笔买入不超过总资产的 50%，持币市值不超过总资产的 80%，每笔不能低于交易所最小下单额 5 USDT；算上可用 USDT，现在最多还能买入 20.00 USDT',
-      '现在能否买入：不可以（交易冷却时间',
-      '现在能否卖出：可以',
+      '风控规则：单笔买入≤总资产的 50%，持币≤总资产的 80%，每日最多 6 笔，冷却 60 分钟，当日亏损 5% 熔断；最小下单额 5 USDT',
+      '风控状态：今日已成交 0 笔（剩余 6 笔），冷却剩余 50 分钟，未熔断',
+      '本赛季：累计已实现盈亏 +1.00 USDT，累计手续费 0.50 USDT',
+      '本轮可执行：不可买（交易冷却时间',
+      '可卖 0.001 BTC',
       '涨跌幅：最近 1 小时 +0.00%，最近 4 小时 +0.05%，最近 12 小时 +0.19%，最近 24 小时 +0.39%',
       '最近 24 小时最高 59822.3，最低 58410；最新收盘比最高 -0.99%，比最低 +1.40%',
       'ATR14',
@@ -97,7 +101,7 @@ describe('提示词', () => {
     const prompt = buildDecidePrompt({ ...input, position: null, stopRules: { stopLossPct: 0, trailingStopPct: 3 }, recentDecisions: [], recentFills: [] })
     expect(prompt).toContain('持仓：空仓')
     expect(prompt).toContain('止损关闭，从持仓以来最高价回落 3% 止损')
-    expect(prompt).toContain('你最近的决策：\n（暂无）')
+    expect(prompt).toContain('你最近的决策（从早到晚）：\n（暂无）')
   })
 
   it('系统提示词是中性的目标描述；输出格式先写理由再给结论', () => {
@@ -123,6 +127,17 @@ describe('LLM 决策', () => {
     expect(r.raw).toContain('101')
     expect(r.error).toMatch(/size_pct/)
     expect(r.calls).toHaveLength(2)
+  })
+
+  it('输出被截断（finish_reason=length）：记为输出不合格，不重试', async () => {
+    const fetchFn = (async () => new Response(JSON.stringify({
+      choices: [{ message: { content: '{"action":"buy"' }, finish_reason: 'length' }],
+      usage: { prompt_tokens: 10, completion_tokens: 5 }
+    }))) as unknown as typeof fetch
+    const r = await new OpenAiLlm({ baseUrl: 'http://llm.local/v1', apiKey: 'k', model: 'm', fetch: fetchFn }).decide(input)
+    expect(r).toMatchObject({ action: 'hold', status: 'invalid_output' })
+    expect(r.calls).toHaveLength(1)
+    expect(r.error).toContain('输出被截断')
   })
 
   it('两次都请求失败：程序代为观望，记为“请求失败”', async () => {

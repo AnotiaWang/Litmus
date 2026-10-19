@@ -7,9 +7,10 @@
  *
  * 横轴按真实时间（时间戳）排布，服务停机等造成的断档会在曲线上留出空白，而不是被挤在一起。
  */
-import { Chart, Legend, LinearScale, LineElement, PointElement, Tooltip, type ChartData, type ChartOptions } from 'chart.js'
+import { Chart, Legend, LinearScale, LineElement, PointElement, Tooltip, type Chart as ChartInstance, type ChartData, type ChartOptions, type TooltipItem } from 'chart.js'
 import { Line } from 'vue-chartjs'
-import type { AgentPublic, EquityResponse } from '#shared/types/api'
+import type { AgentPublic, EquityResponse, EquityTrade } from '#shared/types/api'
+import { alignedTicks, hexToRgba, tickLabel, withGaps, type ChartPoint } from '~/utils/chart'
 
 Chart.register(LinearScale, PointElement, LineElement, Tooltip, Legend)
 
@@ -17,6 +18,7 @@ const props = defineProps<{
   points: EquityResponse['points']
   startPrice: string | null
   base: EquityResponse['base']
+  trades?: EquityTrade[]
   intervalMs: number
   /** 初始资金：范围开始前还没有资产记录的模型，以它为收益率的分母 */
   capital: string
@@ -41,27 +43,92 @@ const rangeItems = [
 ]
 
 /** v：提示框里显示的原始值（模型是资产 USDT，一直持有是价格） */
-type Point = { x: number, y: number | null, v?: number }
-
-/**
- * 两点间隔超过常规间隔的 3 倍时视为断档，插入空值让曲线断开。
- * 常规间隔取后端给的运行间隔（已乘上抽样步长）和数据里 75% 分位数间隔中较大的一个：
- * 手动运行会在两轮之间多插一个点，只会让间隔变短，运行间隔给了下限，不会把正常间隔误判成断档。
- */
-function withGaps(values: Point[], intervalMs: number): Point[] {
-  if (values.length < 3) return values
-  const diffs = values.slice(1).map((v, i) => v.x - values[i]!.x).sort((a, b) => a - b)
-  const threshold = Math.max(intervalMs, diffs[Math.floor(diffs.length * 0.75)]!) * 3
-  const out: Point[] = [values[0]!]
-  for (let i = 1; i < values.length; i++) {
-    const prev = values[i - 1]!
-    if (values[i]!.x - prev.x > threshold) out.push({ x: (prev.x + values[i]!.x) / 2, y: null })
-    out.push(values[i]!)
-  }
-  return out
-}
+type Point = ChartPoint
+type TradePoint = ChartPoint & { trade: EquityTrade, agentName: string, color: string }
+interface HoldingBand { start: number, end: number, color: string, lane: number }
 
 const pct = (value: number, base: number) => (value / base - 1) * 100
+
+const agentById = computed(() => new Map(props.agents.map(a => [a.id, a])))
+
+/** 把成交按时间对齐到最近的资产点，y 用当时的收益率 */
+const tradePoints = computed(() => {
+  const out: { buy: TradePoint[], sell: TradePoint[] } = { buy: [], sell: [] }
+  for (const trade of props.trades ?? []) {
+    const agent = agentById.value.get(trade.agentId)
+    if (!agent) continue
+    const t = new Date(trade.t).getTime()
+    const point = props.points.find(p => new Date(p.t).getTime() === t)
+      ?? props.points.find(p => new Date(p.t).getTime() >= t)
+      ?? props.points.at(-1)
+    if (!point) continue
+    const key = String(trade.agentId)
+    const value = point.values[key]
+    if (value === undefined) continue
+    const from = props.base.values[key] !== undefined ? Number(props.base.values[key]) : Number(props.capital)
+    out[trade.side].push({
+      x: new Date(point.t).getTime(),
+      y: pct(Number(value), from),
+      v: Number(value),
+      trade,
+      agentName: agent.name,
+      color: agent.color
+    })
+  }
+  return out
+})
+
+/** 持仓区间：从持币数量由 0 变成正数开始，到回到 0 结束；部分卖出不会中断 */
+const holdingBands = computed<HoldingBand[]>(() => {
+  const bands: HoldingBand[] = []
+  const lastT = props.points.at(-1) ? new Date(props.points.at(-1)!.t).getTime() : 0
+  props.agents.forEach((agent, lane) => {
+    const trades = (props.trades ?? [])
+      .filter(t => t.agentId === agent.id)
+      .sort((a, b) => a.t.localeCompare(b.t))
+    const firstT = props.points[0] ? new Date(props.points[0].t).getTime() : 0
+    let qty = Number(props.points[0]?.bases[String(agent.id)] ?? 0)
+    let start: number | null = qty > 1e-9 ? firstT : null
+    for (const trade of trades) {
+      const before = qty
+      qty += trade.side === 'buy' ? Number(trade.qty) : -Number(trade.qty)
+      const time = new Date(trade.t).getTime()
+      if (before <= 1e-9 && qty > 1e-9 && start === null) start = time
+      else if (before > 1e-9 && qty <= 1e-9 && start !== null) {
+        bands.push({ start, end: time, color: agent.color, lane })
+        start = null
+      }
+    }
+    if (start !== null && lastT > start) bands.push({ start, end: lastT, color: agent.color, lane })
+  })
+  return bands
+})
+
+/** 在图表底部画每个模型的持仓色条，不遮挡收益曲线 */
+const holdingBandsPlugin = {
+  id: 'holdingBands',
+  afterDraw(chart: ChartInstance) {
+    const options = chart.options.plugins as unknown as { holdingBands?: { bands?: HoldingBand[] } } | undefined
+    const bands = options?.holdingBands?.bands ?? []
+    if (!bands.length) return
+    const area = chart.chartArea
+    const x = chart.scales.x
+    if (!x) return
+    const ctx = chart.ctx
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(area.left, area.top, area.width, area.height)
+    ctx.clip()
+    for (const band of bands) {
+      const x1 = Math.max(area.left, x.getPixelForValue(band.start))
+      const x2 = Math.min(area.right, x.getPixelForValue(band.end))
+      if (x2 <= x1) continue
+      ctx.fillStyle = hexToRgba(band.color, 0.7)
+      ctx.fillRect(x1, area.bottom - 5 - band.lane * 7, x2 - x1, 4)
+    }
+    ctx.restore()
+  }
+}
 
 const data = computed<ChartData<'line', Point[]>>(() => {
   const ts = props.points.map(p => new Date(p.t).getTime())
@@ -100,28 +167,29 @@ const data = computed<ChartData<'line', Point[]>>(() => {
       pointHoverRadius: 3
     })
   }
+
+  for (const [side, label, pointStyle] of [
+    ['buy', '买入', 'triangle'],
+    ['sell', '卖出', 'rectRot']
+  ] as const) {
+    const items = tradePoints.value[side]
+    if (!items.length) continue
+    datasets.push({
+      label,
+      data: items,
+      showLine: false,
+      pointRadius: 5,
+      pointHoverRadius: 7,
+      pointStyle,
+      pointBackgroundColor: items.map(i => i.color),
+      pointBorderColor: '#ffffff',
+      pointBorderWidth: 1,
+      borderWidth: 0,
+      order: 0
+    } as ChartData<'line', Point[]>['datasets'][number])
+  }
   return { datasets }
 })
-
-const HOUR = 3_600_000
-const TICK_STEPS = [1, 2, 3, 6, 12, 24, 48, 168, 336, 720, 2160].map(h => h * HOUR)
-
-/** 刻度对齐到本地时间的整点 / 0 点，最多 8 个刻度 */
-function alignedTicks(min: number, max: number): Array<{ value: number }> {
-  const step = TICK_STEPS.find(s => (max - min) / s <= 8) ?? TICK_STEPS.at(-1)!
-  const offset = -new Date(min).getTimezoneOffset() * 60_000
-  const ticks = []
-  for (let t = Math.ceil((min + offset) / step) * step - offset; t <= max; t += step) ticks.push({ value: t })
-  return ticks
-}
-
-/** 横轴刻度：跨度 1 天内只显示时分，7 天内显示日期和时分，更长只显示日期 */
-function tickLabel(ms: number, spanMs: number): string {
-  const d = new Date(ms)
-  if (spanMs <= 36 * HOUR) return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
-  if (spanMs <= 8 * 24 * HOUR) return fmtTime(d.toISOString())
-  return d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
-}
 
 const options = computed<ChartOptions<'line'>>(() => {
   const dark = colorMode.value === 'dark'
@@ -142,19 +210,25 @@ const options = computed<ChartOptions<'line'>>(() => {
       tooltip: {
         mode: 'index',
         intersect: false,
-        filter: item => item.parsed.y !== null,
-        itemSort: (a, b) => (b.parsed.y ?? 0) - (a.parsed.y ?? 0),
+        filter: (item: TooltipItem<'line'>) => item.parsed.y !== null,
+        itemSort: (a: TooltipItem<'line'>, b: TooltipItem<'line'>) => (b.parsed.y ?? 0) - (a.parsed.y ?? 0),
         callbacks: {
-          title: items => items[0] ? fmtDateTime(new Date(items[0].parsed.x!).toISOString()) : '',
-          label: (ctx) => {
-            const raw = ctx.raw as Point
-            // 一直持有是最后一条线
+          title: (items: TooltipItem<'line'>[]) => items[0] ? fmtDateTime(new Date(items[0].parsed.x!).toISOString()) : '',
+          label: (ctx: TooltipItem<'line'>) => {
+            const raw = ctx.raw as TradePoint & Point
+            if (raw.trade) {
+              const side = raw.trade.side === 'buy' ? '买入' : '卖出'
+              const pnl = raw.trade.realizedPnl === null ? '' : `，已实现 ${fmtNumber(raw.trade.realizedPnl)} USDT`
+              return `${raw.agentName} ${side} ${fmtQty(raw.trade.qty)} ${baseAssetOf(props.symbol)} @ ${fmtPrice(raw.trade.price)}${pnl}`
+            }
+            // 一直持有是资产线之后、买卖点之前的那条虚线
             const detail = ctx.datasetIndex === props.agents.length ? `价格 ${fmtPrice(raw.v)}` : `${fmtNumber(raw.v)} USDT`
             return `${ctx.dataset.label}：${fmtPct(ctx.parsed.y)}（${detail}）`
           }
         }
-      }
-    },
+      },
+      holdingBands: { bands: holdingBands.value }
+    } as unknown as ChartOptions<'line'>['plugins'],
     scales: {
       x: {
         type: 'linear',
@@ -190,7 +264,7 @@ const options = computed<ChartOptions<'line'>>(() => {
             {{ title ?? '收益率走势' }}
           </h2>
           <p class="text-xs text-muted">
-            {{ base.price ? '从所选时间范围的起点算起' : `相对初始资金 ${fmtNumber(capital, 0)} USDT` }} · 虚线为同期一直持有 {{ baseAssetOf(symbol) }}
+            {{ base.price ? '从所选时间范围的起点算起' : `相对初始资金 ${fmtNumber(capital, 0)} USDT` }} · 虚线为同期一直持有 {{ baseAssetOf(symbol) }} · 三角/方块为买卖，底部色条为持仓区间
           </p>
         </div>
         <USelect
@@ -213,6 +287,7 @@ const options = computed<ChartOptions<'line'>>(() => {
       <Line
         :data="data"
         :options="options"
+        :plugins="[holdingBandsPlugin]"
       />
     </div>
   </UCard>

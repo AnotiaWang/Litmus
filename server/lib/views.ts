@@ -5,8 +5,9 @@
  * 这里返回的内容可能公开给任何人看：不包含 Provider 地址、Key 或口令。
  */
 import Decimal from 'decimal.js'
-import type { AgentPublic, EquityResponse, SeasonSummary, Standing, StandingsResponse, StatusResponse } from '../../shared/types/api'
-import type { AgentRow, SeasonRow, Store } from './db'
+import type { AdminHealthResponse, AgentPublic, EquityResponse, SeasonSummary, Standing, StandingsResponse, StatusResponse } from '../../shared/types/api'
+import { ENGINE_VERSION, PROMPT_VERSION } from '../../shared/versions'
+import type { AgentRow, EntryStats, SeasonRow, Store } from './db'
 import type { Engine } from './engine'
 import { stopLine } from './strategy'
 
@@ -16,7 +17,15 @@ export interface ViewDeps {
   nextRunAt: string | null
 }
 
-export const seasonSummary = (s: SeasonRow): SeasonSummary => ({ id: s.id, name: s.name, startedAt: s.startedAt, endedAt: s.endedAt, config: s.config })
+export const seasonSummary = (s: SeasonRow): SeasonSummary => ({
+  id: s.id,
+  name: s.name,
+  startedAt: s.startedAt,
+  endedAt: s.endedAt,
+  config: s.config,
+  promptVersion: s.promptVersion,
+  engineVersion: s.engineVersion
+})
 
 export function agentPublic(a: AgentRow, providerNames: Map<number, string>): AgentPublic {
   return {
@@ -54,6 +63,12 @@ const pct = (value: Decimal.Value, base: Decimal.Value) => {
   return b.gt(0) ? new Decimal(value).minus(b).div(b).mul(100).toFixed(2) : null
 }
 
+/** 按 token 用量和模型配置的单价估算成本；没配置单价时为 null */
+function estimatedCost(agent: AgentRow, s: EntryStats | undefined): number | null {
+  if (!s || agent.inputPricePerM === null || agent.outputPricePerM === null) return null
+  return Number((s.llmPromptTokens / 1_000_000 * agent.inputPricePerM + s.llmCompletionTokens / 1_000_000 * agent.outputPricePerM).toFixed(4))
+}
+
 /** 赛季排行榜：每个参赛模型的资产、收益、回撤、成交和 LLM 统计，按收益率从高到低排列（还没运行过的排最后） */
 export function standingsView(store: Store, season: SeasonRow, now = new Date()): StandingsResponse {
   const agents = new Map(store.listAgents().map(a => [a.id, a]))
@@ -61,7 +76,13 @@ export function standingsView(store: Store, season: SeasonRow, now = new Date())
   const latest = store.latestEquity(season.id)
   const drawdowns = store.maxDrawdowns(season.id)
   const stats = store.entryStats(season.id)
+  const exposures = store.exposureStats(season.id)
+  const returnStats = store.returnStats(season.id)
+  const latency = store.llmLatency(season.id)
   const capital = season.config.initialCapital
+  const first = store.firstPricedTick(season.id)
+  const last = store.latestTick(season.id)
+  const sampleBase = store.seasonSample(season.id)
 
   const standings: Standing[] = store.listEntries(season.id).flatMap((entry) => {
     const agent = agents.get(entry.agentId)
@@ -78,6 +99,9 @@ export function standingsView(store: Store, season: SeasonRow, now = new Date())
     const returnPct = snap ? pct(snap.total, capital) : null
     const benchmarkReturnPct = snap && initial ? pct(snap.price, initial.price) : null
     const circuit = state.getCircuit()
+    const unrealizedPnl = holding ? base!.mul(snap!.price).minus(position.cost) : null
+    const profitFactor = s && s.grossLoss < 0 ? Number((s.grossProfit / Math.abs(s.grossLoss)).toFixed(2)) : null
+    const llmLatency = latency.get(agent.id)
     return [{
       agent: agentPublic(agent, names),
       joinedAt: entry.joinedAt,
@@ -99,6 +123,12 @@ export function standingsView(store: Store, season: SeasonRow, now = new Date())
       sells: s?.sells ?? 0,
       wins: s?.wins ?? 0,
       feesUsdt: (s?.fees ?? 0).toFixed(2),
+      realizedPnl: (s?.realizedPnl ?? 0).toFixed(2),
+      unrealizedPnl: unrealizedPnl !== null ? unrealizedPnl.toFixed(2) : null,
+      profitFactor,
+      avgExposurePct: exposures.has(agent.id) ? Number(exposures.get(agent.id)!.toFixed(2)) : null,
+      periodVolPct: returnStats.get(agent.id)?.periodVolPct ?? null,
+      returnTStat: returnStats.get(agent.id)?.tStat ?? null,
       llm: agent.kind === 'llm'
         ? {
             asked: s?.llmAsked ?? 0,
@@ -106,8 +136,15 @@ export function standingsView(store: Store, season: SeasonRow, now = new Date())
             invalidOutput: s?.llmInvalid ?? 0,
             requestFailed: s?.llmFailed ?? 0,
             avgDurationMs: s?.llmAvgDurationMs ?? null,
+            p50DurationMs: llmLatency?.p50 ?? null,
+            p95DurationMs: llmLatency?.p95 ?? null,
+            maxDurationMs: llmLatency?.max ?? null,
             promptTokens: s?.llmPromptTokens ?? 0,
-            completionTokens: s?.llmCompletionTokens ?? 0
+            completionTokens: s?.llmCompletionTokens ?? 0,
+            retries: s?.llmRetries ?? 0,
+            http429: s?.llmHttp429 ?? 0,
+            timeouts: s?.llmTimeouts ?? 0,
+            costUsd: estimatedCost(agent, s)
           }
         : null,
       circuit: circuit && new Date(circuit.until) > now ? circuit : null
@@ -115,14 +152,20 @@ export function standingsView(store: Store, season: SeasonRow, now = new Date())
   })
   standings.sort((a, b) => (b.returnPct === null ? -Infinity : Number(b.returnPct)) - (a.returnPct === null ? -Infinity : Number(a.returnPct)))
 
-  const first = store.firstPricedTick(season.id)
-  const last = store.latestTick(season.id)
+  const days = first && last ? Math.max(0, (new Date(last.at).getTime() - new Date(first.at).getTime()) / 86_400_000) : 0
   return {
     season: seasonSummary(season),
     asOf: last?.price ? last.at : null,
     price: last?.price ?? null,
     benchmarkReturnPct: first?.price && last?.price ? pct(last.price, first.price) : null,
-    standings
+    standings,
+    sample: {
+      days: Number(days.toFixed(2)),
+      rounds: sampleBase.rounds,
+      decisions: sampleBase.decisions,
+      trades: sampleBase.trades
+    },
+    codeVersions: { promptVersion: PROMPT_VERSION, engineVersion: ENGINE_VERSION }
   }
 }
 
@@ -131,5 +174,55 @@ export function equityView(store: Store, season: SeasonRow, days: number, now = 
   const since = new Date(now.getTime() - days * 86_400_000).toISOString()
   const { step, points } = store.equitySeries(season.id, since, maxPoints)
   const startPrice = store.firstPricedTick(season.id)?.price ?? null
-  return { seasonId: season.id, points, startPrice, base: store.equityBefore(season.id, since), intervalMs: season.config.checkIntervalMinutes * 60_000 * step }
+  return {
+    seasonId: season.id,
+    points,
+    startPrice,
+    base: store.equityBefore(season.id, since),
+    trades: store.listFills(season.id).filter(t => t.t >= since),
+    intervalMs: season.config.checkIntervalMinutes * 60_000 * step
+  }
+}
+
+/** 管理页的模型健康：按当前赛季汇总每个 LLM 模型的稳定性、耗时和成本 */
+export function healthView(store: Store, season: SeasonRow): AdminHealthResponse {
+  const agents = new Map(store.listAgents().map(a => [a.id, a]))
+  const stats = store.entryStats(season.id)
+  const latency = store.llmLatency(season.id)
+  const errors = store.lastLlmErrors(season.id)
+  const asked = store.lastLlmAsked(season.id)
+  const last = store.latestTick(season.id)
+
+  const models = store.listEntries(season.id).flatMap((entry) => {
+    const agent = agents.get(entry.agentId)
+    if (!agent || agent.kind !== 'llm') return []
+    const s = stats.get(agent.id)
+    const l = latency.get(agent.id)
+    const e = errors.get(agent.id)
+    return [{
+      agentId: agent.id,
+      name: agent.name,
+      color: agent.color,
+      status: agent.status,
+      lastAskedAt: asked.get(agent.id) ?? null,
+      lastError: e?.error ?? null,
+      lastErrorAt: e?.at ?? null,
+      asked: s?.llmAsked ?? 0,
+      ok: s?.llmOk ?? 0,
+      invalidOutput: s?.llmInvalid ?? 0,
+      requestFailed: s?.llmFailed ?? 0,
+      retries: s?.llmRetries ?? 0,
+      http429: s?.llmHttp429 ?? 0,
+      timeouts: s?.llmTimeouts ?? 0,
+      avgDurationMs: s?.llmAvgDurationMs ?? null,
+      p50DurationMs: l?.p50 ?? null,
+      p95DurationMs: l?.p95 ?? null,
+      maxDurationMs: l?.max ?? null,
+      promptTokens: s?.llmPromptTokens ?? 0,
+      completionTokens: s?.llmCompletionTokens ?? 0,
+      costUsd: estimatedCost(agent, s)
+    }]
+  })
+
+  return { seasonId: season.id, asOf: last?.at ?? null, models }
 }

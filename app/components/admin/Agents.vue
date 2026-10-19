@@ -16,6 +16,7 @@ const { request } = useApi()
 const toast = useToast()
 
 const active = computed(() => props.agents.filter(a => a.status === 'active'))
+const paused = computed(() => props.agents.filter(a => a.status === 'paused'))
 const archived = computed(() => props.agents.filter(a => a.status === 'archived'))
 
 function subtitle(a: AgentAdminView) {
@@ -56,6 +57,21 @@ async function test(a: AgentAdminView) {
     testResult.value = await request<AgentTestResult>(`/api/admin/agents/${a.id}/test`, { method: 'POST' })
   } catch (e) {
     testError.value = errorMessage(e)
+  }
+}
+
+// ---------- 暂停 / 恢复 ----------
+const statusBusy = ref<number | null>(null)
+async function setStatus(a: AgentAdminView, action: 'pause' | 'resume') {
+  statusBusy.value = a.id
+  try {
+    await request(`/api/admin/agents/${a.id}/${action}`, { method: 'POST' })
+    toast.add({ title: action === 'pause' ? `已暂停 ${a.name}` : `已恢复 ${a.name}`, color: action === 'pause' ? 'warning' : 'success' })
+    emit('changed')
+  } catch (e) {
+    toast.add({ title: '操作失败', description: errorMessage(e), color: 'error' })
+  } finally {
+    statusBusy.value = null
   }
 }
 
@@ -156,6 +172,107 @@ async function confirmPending() {
               @click="test(a)"
             >
               测试
+            </UButton>
+            <UButton
+              color="neutral"
+              variant="ghost"
+              icon="i-lucide-pencil"
+              @click="openEdit(a)"
+            >
+              修改
+            </UButton>
+            <UButton
+              color="warning"
+              variant="ghost"
+              icon="i-lucide-pause"
+              :loading="statusBusy === a.id"
+              :disabled="running"
+              @click="setStatus(a, 'pause')"
+            >
+              暂停
+            </UButton>
+            <UButton
+              v-if="a.deletable"
+              color="error"
+              variant="ghost"
+              icon="i-lucide-trash-2"
+              :disabled="running"
+              @click="pending = { kind: 'delete', agent: a }"
+            >
+              删除
+            </UButton>
+            <UButton
+              v-else
+              color="neutral"
+              variant="ghost"
+              icon="i-lucide-archive"
+              :disabled="running"
+              @click="pending = { kind: 'archive', agent: a }"
+            >
+              归档
+            </UButton>
+          </div>
+        </li>
+      </ul>
+    </UCard>
+
+    <UCard
+      v-if="paused.length"
+      :ui="{ body: 'p-0 sm:p-0' }"
+    >
+      <template #header>
+        <h2 class="font-semibold">
+          已暂停
+        </h2>
+        <p class="text-xs text-muted">
+          暂停期间不询问 LLM、不交易，账本和持仓保留；恢复后从下一轮继续。
+        </p>
+      </template>
+      <ul class="divide-y divide-default">
+        <li
+          v-for="a in paused"
+          :key="a.id"
+          class="flex flex-col gap-2 p-4 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div class="flex min-w-0 items-start gap-3">
+            <span
+              class="mt-1.5 size-3 shrink-0 rounded-full opacity-70"
+              :style="{ backgroundColor: a.color }"
+            />
+            <div class="min-w-0">
+              <p class="flex flex-wrap items-center gap-2 font-medium">
+                {{ a.name }}
+                <UBadge
+                  v-if="a.kind === 'baseline'"
+                  size="sm"
+                  color="neutral"
+                  variant="outline"
+                >
+                  基线
+                </UBadge>
+                <UBadge
+                  size="sm"
+                  color="warning"
+                  variant="subtle"
+                >
+                  已暂停
+                </UBadge>
+              </p>
+              <p class="text-sm break-all text-muted">
+                {{ subtitle(a) }}
+              </p>
+            </div>
+          </div>
+          <div class="flex shrink-0 flex-wrap gap-1">
+            <UButton
+              color="success"
+              variant="ghost"
+              icon="i-lucide-play"
+              :loading="statusBusy === a.id"
+              :disabled="running"
+              @click="setStatus(a, 'resume')"
+            >
+              恢复
             </UButton>
             <UButton
               color="neutral"

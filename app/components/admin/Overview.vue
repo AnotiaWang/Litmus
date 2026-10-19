@@ -241,6 +241,8 @@ watch(status, () => {
       </div>
     </UCard>
 
+    <AdminHealth />
+
     <UCard v-if="settings">
       <template #header>
         <h2 class="font-semibold">

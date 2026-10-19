@@ -54,6 +54,14 @@ function pickPreset(p: RiskPreset) {
 
 const klineMinutes: Record<string, number> = { '15m': 15, '30m': 30, '1h': 60, '2h': 120, '4h': 240, '6h': 360, '8h': 480, '12h': 720, '1d': 1440 }
 const askPerDay = computed(() => Math.round(1440 / klineMinutes[state.value.klineInterval]!))
+const coverageHours = computed(() => state.value.llmKlines * klineMinutes[state.value.klineInterval]! / 60)
+const fastCadence = computed(() => klineMinutes[state.value.klineInterval]! < 60)
+const intervalMismatch = computed(() => {
+  const k = klineMinutes[state.value.klineInterval]!
+  if (state.value.checkIntervalMinutes < k) return `运行间隔比决策周期短：每根 K 线会运行 ${Math.round(k / state.value.checkIntervalMinutes)} 轮，但只询问一次 LLM。`
+  if (state.value.checkIntervalMinutes > k) return '运行间隔比决策周期长：会跳过部分 K 线，LLM 不会在每个 K 线收盘后被询问。'
+  return ''
+})
 
 async function save() {
   saving.value = true
@@ -132,7 +140,7 @@ async function save() {
           <UFormField
             name="klineInterval"
             label="决策周期（K 线）"
-            :description="`每根 K 线收盘后问每个模型一次，约每天 ${askPerDay} 次。`"
+            :description="`每根 K 线收盘后问每个模型一次，约每天 ${askPerDay} 次；推荐 1h 或 4h。`"
           >
             <USelect
               v-model="state.klineInterval"
@@ -141,6 +149,29 @@ async function save() {
             />
           </UFormField>
         </section>
+
+        <UAlert
+          v-if="fastCadence"
+          color="warning"
+          variant="subtle"
+          icon="i-lucide-gauge"
+          title="高频决策的成本和噪声都更高"
+          :description="`${state.klineInterval} 每天约询问 ${askPerDay} 次/模型，乘上参赛模型数就是总调用量。15m/30m 的信号更容易被噪声主导，token 和延迟也更高；建议优先用 1h 或 4h。`"
+        />
+        <UAlert
+          v-if="coverageHours < 24"
+          color="info"
+          variant="subtle"
+          icon="i-lucide-info"
+          :description="`发给 LLM 的 ${state.llmKlines} 根 ${state.klineInterval} K 线只覆盖约 ${fmtNumber(coverageHours, 1)} 小时，系统会自动附加最近 14 根日线补足长周期。`"
+        />
+        <UAlert
+          v-if="intervalMismatch"
+          color="warning"
+          variant="subtle"
+          icon="i-lucide-clock"
+          :description="intervalMismatch"
+        />
 
         <section class="space-y-3">
           <div>
