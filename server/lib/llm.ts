@@ -138,6 +138,8 @@ export interface DecideResult {
   error?: string
   /** 每次请求的详情，按时间顺序 */
   calls: LlmCall[]
+  /** 实际尝试了几次（不含“去掉 response_format 后重发”这种协议层面的重发），重试次数 = attempts - 1 */
+  attempts: number
   prompt: LlmPrompt
 }
 
@@ -318,8 +320,11 @@ export interface OpenAiLlmOptions {
 }
 
 type Asked<T>
-  = | { ok: true, value: T, raw: string, calls: LlmCall[] }
-    | { ok: false, error: string, raw: string | null, calls: LlmCall[] }
+  = | { ok: true, value: T, raw: string, calls: LlmCall[], attempts: number }
+    | { ok: false, error: string, raw: string | null, calls: LlmCall[], attempts: number }
+
+/** 请求超时时记在 LlmCall.error 里的固定文本，引擎按它统计超时次数 */
+export const LLM_TIMEOUT_ERROR = 'LLM 请求超时'
 
 export class OpenAiLlm implements Decider {
   /** 有的兼容服务不支持 response_format，遇到 400 后关掉，之后不再发送 */
@@ -333,7 +338,7 @@ export class OpenAiLlm implements Decider {
   async decide(input: DecideInput): Promise<DecideResult> {
     const prompt: LlmPrompt = { system: DECIDE_SYSTEM_PROMPT, user: buildDecidePrompt(input) }
     const r = await this.ask(prompt, parseDecision)
-    if (r.ok) return { ...r.value, raw: r.raw, status: 'ok', calls: r.calls, prompt }
+    if (r.ok) return { ...r.value, raw: r.raw, status: 'ok', calls: r.calls, attempts: r.attempts, prompt }
     return {
       action: 'hold',
       sizePct: 0,
@@ -344,11 +349,16 @@ export class OpenAiLlm implements Decider {
       status: r.calls.some(c => c.content !== null) ? 'invalid_output' : 'request_failed',
       error: r.error,
       calls: r.calls,
+      attempts: r.attempts,
       prompt
     }
   }
 
-  /** 发送提示词并解析，出错或不合格时重试 1 次。原始返回（多次时用分隔线拼接）和每次请求的记录都带回去。 */
+  /**
+   * 发送提示词并解析，出错或不合格时重试 1 次。原始返回（多次时用分隔线拼接）和每次请求的记录都带回去。
+   * 输出被截断（finish_reason=length）且解析不了时不再重试：重试大概率还是截断，白白多花一次钱；
+   * 截断了但正文仍是合法 JSON（有的服务会这样标）就照常采用。
+   */
   private async ask<T>(prompt: LlmPrompt, parse: (content: string) => T): Promise<Asked<T>> {
     const messages = [
       { role: 'system', content: prompt.system },
@@ -357,27 +367,30 @@ export class OpenAiLlm implements Decider {
     const calls: LlmCall[] = []
     const raws: string[] = []
     const errors: string[] = []
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let attempts = 0
+    while (attempts < 2) {
+      attempts++
       let content: string
       try {
         content = await this.complete(messages, calls)
       } catch (e) {
         errors.push((e as Error).message)
-        // 输出被截断时重试大概率还是截断，白白多花一次钱
-        if (/输出被截断/.test((e as Error).message)) break
         continue
       }
       raws.push(content)
+      const call = calls.at(-1)!
       try {
-        return { ok: true, value: parse(content), raw: raws.join('\n---\n'), calls }
+        return { ok: true, value: parse(content), raw: raws.join('\n---\n'), calls, attempts }
       } catch (e) {
-        errors.push((e as Error).message)
-        calls.at(-1)!.error = `输出不合格：${(e as Error).message}`
-        // 输出被截断时重试大概率还是截断，白白多花一次钱
-        if (/输出被截断/.test((e as Error).message)) break
+        const truncated = call.finishReason === 'length'
+        const message = truncated ? `输出被截断（finish_reason=length）：${(e as Error).message}` : (e as Error).message
+        errors.push(message)
+        call.error = `输出不合格：${message}`
+        if (truncated) break
       }
     }
-    return { ok: false, error: `LLM 两次都没有给出合法结果：${errors.join('；')}`, raw: raws.length ? raws.join('\n---\n') : null, calls }
+    const summary = attempts > 1 ? `LLM 两次都没有给出合法结果：${errors.join('；')}` : `LLM 没有给出合法结果：${errors.join('；')}`
+    return { ok: false, error: summary, raw: raws.length ? raws.join('\n---\n') : null, calls, attempts }
   }
 
   /** 发一次请求，返回正文（已去掉 <think>）。每次请求都往 calls 里追加一条记录，失败时记下原因再抛出。 */
@@ -421,7 +434,7 @@ export class OpenAiLlm implements Decider {
     } catch (e) {
       call.durationMs = Date.now() - started
       const name = (e as Error).name
-      return fail(name === 'TimeoutError' || name === 'AbortError' ? 'LLM 请求超时' : `LLM 网络错误：${(e as Error).message}`, e)
+      return fail(name === 'TimeoutError' || name === 'AbortError' ? LLM_TIMEOUT_ERROR : `LLM 网络错误：${(e as Error).message}`, e)
     }
     const text = await res.text()
     call.durationMs = Date.now() - started
@@ -447,8 +460,6 @@ export class OpenAiLlm implements Decider {
     const { content, think } = splitThink(message.content)
     call.reasoning = clip(reasoningOf(message) ?? think)
     call.content = clip(content)
-    // 拿到了正文但被截断：算模型输出不合格，不算服务请求失败
-    if (call.finishReason === 'length') return fail('输出被截断（finish_reason=length），不再重试')
     return content
   }
 }

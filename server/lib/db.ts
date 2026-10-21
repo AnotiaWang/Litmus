@@ -22,6 +22,7 @@ import Decimal from 'decimal.js'
 import type { AgentInput, AgentUpdate, ProviderInput } from '../../shared/agents'
 import { appSettingsSchema, seasonConfigFieldsSchema, type AppSettings, type SeasonConfig } from '../../shared/settings'
 import type { AgentKind, Decision, DecisionSummary, Outcome } from '../../shared/types/api'
+import { LEGACY_VERSION } from '../../shared/versions'
 import type { Ledger, Position } from './ledger'
 
 export type { Decision, DecisionSummary, Outcome }
@@ -516,8 +517,8 @@ export class Store {
       add('decisions', 'llm_retries', 'INTEGER NOT NULL DEFAULT 0')
       add('decisions', 'llm_http_429', 'INTEGER NOT NULL DEFAULT 0')
       add('decisions', 'llm_timeouts', 'INTEGER NOT NULL DEFAULT 0')
-      this.db.exec(`UPDATE seasons SET prompt_version = 'legacy' WHERE prompt_version = ''`)
-      this.db.exec(`UPDATE seasons SET engine_version = 'legacy' WHERE engine_version = ''`)
+      this.db.prepare(`UPDATE seasons SET prompt_version = ? WHERE prompt_version = ''`).run(LEGACY_VERSION)
+      this.db.prepare(`UPDATE seasons SET engine_version = ? WHERE engine_version = ''`).run(LEGACY_VERSION)
     })
   }
 
@@ -911,25 +912,35 @@ export class Store {
     return new Map(rows.filter(r => r.avg !== null).map(r => [Number(r.agent_id), Number(r.avg)]))
   }
 
-  /** 每轮收益率的均值和波动：用于判断排名差异是否只是噪声 */
+  /**
+   * 每轮相对“一直持有”的超额收益率（模型这一轮的收益率 − 价格这一轮的涨跌幅）的 t 值，和每轮收益率的波动。
+   * 用超额收益而不是收益本身：单边行情里一直拿着币的模型收益显著不为 0，那只是跟着行情走，不说明决策有用
+   */
   returnStats(seasonId: number): Map<number, { tStat: number | null, periodVolPct: number | null }> {
     const rows = this.db.prepare(`
       WITH r AS (
-        SELECT e.agent_id, CAST(e.total AS REAL) AS total,
-          LAG(CAST(e.total AS REAL)) OVER (PARTITION BY e.agent_id ORDER BY e.tick_id) AS prev
+        SELECT e.agent_id, CAST(e.total AS REAL) AS total, CAST(t.price AS REAL) AS price,
+          LAG(CAST(e.total AS REAL)) OVER (PARTITION BY e.agent_id ORDER BY e.tick_id) AS prev,
+          LAG(CAST(t.price AS REAL)) OVER (PARTITION BY e.agent_id ORDER BY e.tick_id) AS prev_price
         FROM equity e JOIN ticks t ON t.id = e.tick_id WHERE t.season_id = ?
+      ),
+      x AS (
+        SELECT agent_id, total / prev - 1 AS ret, total / prev - price / prev_price AS excess
+        FROM r WHERE prev > 0 AND prev_price > 0
       )
-      SELECT agent_id, COUNT(*) AS n, AVG(total / prev - 1) AS mean,
-        AVG((total / prev - 1) * (total / prev - 1)) AS mean_sq
-      FROM r WHERE prev IS NOT NULL AND prev > 0 GROUP BY agent_id
-    `).all(seasonId) as Array<{ agent_id: number, n: number, mean: number | null, mean_sq: number | null }>
+      SELECT agent_id, COUNT(*) AS n, AVG(ret) AS mean, AVG(ret * ret) AS mean_sq,
+        AVG(excess) AS ex_mean, AVG(excess * excess) AS ex_mean_sq
+      FROM x GROUP BY agent_id
+    `).all(seasonId) as Array<{ agent_id: number, n: number, mean: number | null, mean_sq: number | null, ex_mean: number | null, ex_mean_sq: number | null }>
     return new Map(rows.map((r) => {
       const n = Number(r.n)
-      const mean = Number(r.mean ?? 0)
-      const variance = Math.max(0, Number(r.mean_sq ?? 0) - mean * mean)
-      const sd = Math.sqrt(variance)
+      const sdOf = (mean: number, meanSq: number) => Math.sqrt(Math.max(0, meanSq - mean * mean))
+      const sd = sdOf(Number(r.mean ?? 0), Number(r.mean_sq ?? 0))
+      const exMean = Number(r.ex_mean ?? 0)
+      const exSd = sdOf(exMean, Number(r.ex_mean_sq ?? 0))
       return [Number(r.agent_id), {
-        tStat: n > 1 && sd > 0 ? mean / sd * Math.sqrt(n) : null,
+        // 超额收益几乎恒为 0（一直满仓或一直空仓且没有交易）时波动是浮点噪声，不算 t 值
+        tStat: n > 1 && exSd > 1e-12 ? exMean / exSd * Math.sqrt(n) : null,
         periodVolPct: n > 1 ? sd * Math.sqrt(n) * 100 : null
       }]
     }))

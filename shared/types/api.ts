@@ -180,7 +180,7 @@ export interface Standing {
   avgExposurePct: number | null
   /** 每轮收益率的标准差 × √轮数，近似整个期间的波动幅度 */
   periodVolPct: number | null
-  /** 平均每轮收益率是否显著不为 0：t = 均值 ÷ 标准误 */
+  /** 平均每轮超额收益（相对一直持有）是否显著不为 0：t = 均值 ÷ 标准误 */
   returnTStat: number | null
   /**
    * LLM 询问统计；基线为 null。asked = ok + invalidOutput + requestFailed：

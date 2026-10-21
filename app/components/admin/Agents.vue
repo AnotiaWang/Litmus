@@ -225,7 +225,7 @@ async function confirmPending() {
           已暂停
         </h2>
         <p class="text-xs text-muted">
-          暂停期间不询问 LLM、不交易，账本和持仓保留；恢复后从下一轮继续。
+          暂停期间不询问 LLM、不交易，止损也不执行，资产照常按当前价记录；恢复后从下一轮继续。
         </p>
       </template>
       <ul class="divide-y divide-default">

@@ -135,9 +135,17 @@ describe('LLM 决策', () => {
       usage: { prompt_tokens: 10, completion_tokens: 5 }
     }))) as unknown as typeof fetch
     const r = await new OpenAiLlm({ baseUrl: 'http://llm.local/v1', apiKey: 'k', model: 'm', fetch: fetchFn }).decide(input)
-    expect(r).toMatchObject({ action: 'hold', status: 'invalid_output' })
+    expect(r).toMatchObject({ action: 'hold', status: 'invalid_output', attempts: 1 })
     expect(r.calls).toHaveLength(1)
     expect(r.error).toContain('输出被截断')
+    expect(r.error).not.toContain('两次')
+    expect(r.calls[0]!.error).toContain('输出被截断')
+  })
+
+  it('标了 finish_reason=length 但正文是完整的 JSON：照常采用', async () => {
+    const fetchFn = (async () => new Response(JSON.stringify({ choices: [{ message: { content: ok }, finish_reason: 'length' }] }))) as unknown as typeof fetch
+    const r = await new OpenAiLlm({ baseUrl: 'http://llm.local/v1', apiKey: 'k', model: 'm', fetch: fetchFn }).decide(input)
+    expect(r).toMatchObject({ status: 'ok', action: 'buy', attempts: 1 })
   })
 
   it('两次都请求失败：程序代为观望，记为“请求失败”', async () => {
@@ -161,6 +169,9 @@ describe('LLM 决策', () => {
     expect(r.status).toBe('ok')
     expect(bodies[0]).toMatchObject({ model: 'm', temperature: 0.2, response_format: { type: 'json_object' } })
     expect(bodies[1]!.response_format).toBeUndefined()
+    // 协议层面的重发不算重试
+    expect(r).toMatchObject({ attempts: 1 })
+    expect(r.calls).toHaveLength(2)
   })
 
   it('设置思考强度时发送 reasoning_effort，不发 temperature；额外请求参数原样合并，可以覆盖默认值', async () => {

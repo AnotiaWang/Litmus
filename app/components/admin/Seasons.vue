@@ -14,7 +14,8 @@ const toast = useToast()
 
 const current = computed(() => props.seasons.find(s => s.endedAt === null) ?? null)
 const history = computed(() => props.seasons.filter(s => s.endedAt !== null).sort((a, b) => b.id - a.id))
-const activeCount = computed(() => props.agents.filter(a => a.status === 'active').length)
+// 暂停的模型也会加入新赛季（恢复后继续参赛），所以按未归档的算
+const activeCount = computed(() => props.agents.filter(a => a.status !== 'archived').length)
 
 const formOpen = ref(false)
 

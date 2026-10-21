@@ -77,7 +77,7 @@ function excessText(value: string | null): string {
       </p>
       <p class="mt-1 text-xs text-muted">
         期间波动 {{ standing.periodVolPct === null ? '-' : `${fmtNumber(standing.periodVolPct)}%` }}
-        · t 值 {{ standing.returnTStat === null ? '-' : fmtNumber(standing.returnTStat, 2) }}
+        · 超额 t 值 {{ standing.returnTStat === null ? '-' : fmtNumber(standing.returnTStat, 2) }}
       </p>
     </UCard>
     <UCard>

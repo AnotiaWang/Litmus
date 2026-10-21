@@ -20,7 +20,7 @@ import { INTERVAL_MS, type SeasonConfig } from '../../shared/settings'
 import type { Outcome, RunResult } from '../../shared/types/api'
 import type { AgentRow, Circuit, Decision, DecisionSummary, EntryState, PauseState, SeasonRow, Store } from './db'
 import { applyFill, equityOf, isPosition, paperFill, updatePosition, type Ledger, type Position } from './ledger'
-import { summarizeCalls, type Decider, type DecideInput } from './llm'
+import { LLM_TIMEOUT_ERROR, summarizeCalls, type Decider, type DecideInput } from './llm'
 import { log as defaultLog, redact, type Logger } from './logger'
 import type { Kline, Market, SymbolRules } from './market'
 import { dailyLossPct, evaluateRisk, maxBuyUsdt, precheck, type PrecheckInput } from './risk'
@@ -248,10 +248,11 @@ export class Engine {
     const config = season.config
     const now = this.now()
     const agents = new Map(store.listAgents().map(a => [a.id, a]))
+    // 暂停的模型也参与：和全局暂停一样不问 LLM、不交易，但资产照常按当前价记录，排行榜和曲线不会停在暂停那一刻
     const playing = store.listEntries(season.id)
       .filter(e => !e.leftAt)
       .map(e => agents.get(e.agentId))
-      .filter((a): a is AgentRow => a?.status === 'active')
+      .filter((a): a is AgentRow => a?.status === 'active' || a?.status === 'paused')
 
     let rules: SymbolRules
     let klines: Kline[]
@@ -264,13 +265,20 @@ export class Engine {
       const raw = await market.getKlines(config.symbol, config.klineInterval, KLINE_LIMIT + 1)
       klines = closedKlines(raw, now.getTime()).slice(-KLINE_LIMIT)
       if (!klines.length) throw new Error('没有取到已收盘的 K 线')
-      if (playing.some(a => a.kind === 'llm')) dailyKlines = await dailyKlinesFor(market, config, now)
       price = await market.getPrice(config.symbol)
     } catch (e) {
       const error = `取行情失败，本轮跳过：${redact((e as Error).message)}`
       const tickId = store.insertTick({ seasonId: season.id, at: now.toISOString(), trigger, price: null, error })
       this.log.error(error)
       return { status: 'done', tickId, error, outcomes: [] }
+    }
+    // 日线只是给 LLM 的补充信息：取不到时这一轮的提示词不带日线，不影响基线和其他流程
+    if (playing.some(a => a.kind === 'llm' && a.status === 'active')) {
+      try {
+        dailyKlines = await dailyKlinesFor(market, config, now)
+      } catch (e) {
+        this.log.warn(`取日线失败，本轮提示词不带日线：${redact((e as Error).message)}`)
+      }
     }
 
     const tickId = store.insertTick({ seasonId: season.id, at: now.toISOString(), trigger, price: price.toFixed(), error: null })
@@ -318,6 +326,8 @@ export class Engine {
 
     const ctx: AgentContext = {
       ...tick,
+      // 单个模型暂停时，这个模型按全局暂停处理
+      pause: agent.status === 'paused' && !tick.pause.paused ? { paused: true, since: null } : tick.pause,
       agent,
       state,
       ledger,
@@ -465,9 +475,9 @@ export class Engine {
     ctx.record = true
     const result = await this.deps.deciderFor(agent).decide(input)
     const usage = summarizeCalls(result.calls)
-    const retries = Math.max(0, result.calls.length - 1)
+    const retries = Math.max(0, result.attempts - 1)
     const http429 = result.calls.filter(c => c.httpStatus === 429).length
-    const timeouts = result.calls.filter(c => c.error && /超时|Timeout/i.test(c.error)).length
+    const timeouts = result.calls.filter(c => c.error === LLM_TIMEOUT_ERROR).length
     Object.assign(d, {
       signal: result.action,
       signalNote: result.status === 'ok' ? null : `LLM 没有给出合法结果，程序代为观望，下次在 ${fmtUtc(slot.next)} 之前的每一轮都会重试`,

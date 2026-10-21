@@ -144,7 +144,7 @@ describe('模型', () => {
     expect(standingsView(env.store, env.season).standings[0]).toMatchObject({ leftAt: minutesLater(1).toISOString(), equity: '100' })
   })
 
-  it('暂停 / 恢复：暂停后不再参赛，成绩和历史保留，可以恢复', async () => {
+  it('暂停 / 恢复：暂停后不问 LLM、不交易，资产照常记录；成绩和历史保留，可以恢复', async () => {
     const env = setup({ llm: [hold], baseline: true })
     await run(env)
     const deps = admin(env)
@@ -153,7 +153,8 @@ describe('模型', () => {
     expect(env.store.listEntries(env.season.id).map(e => e.agentId)).toContain(env.llmAgentId)
 
     env.setNow(minutesLater(15))
-    expect((await run(env, 'schedule', env.llmAgentId!)).outcome).toBeNull()
+    expect((await run(env, 'schedule', env.llmAgentId!)).outcome).toBe('paused')
+    expect(env.llm!.calls).toHaveLength(1)
     expect(standingsView(env.store, env.season).standings.find(s => s.agent.id === env.llmAgentId)).toMatchObject({ agent: { status: 'paused' }, equity: '100' })
 
     const resumed = resumeAgent(deps, env.llmAgentId!)

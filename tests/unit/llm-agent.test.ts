@@ -67,6 +67,24 @@ describe('LLM 模型', () => {
     expect(getKlines.mock.calls.map(c => c[1])).toEqual(['1h'])
   })
 
+  it('日线取不到：这一轮提示词不带日线，照常询问 LLM 和运行基线', async () => {
+    const env = setup({ llm: [act('hold')], baseline: true })
+    vi.spyOn(env.market, 'getKlines').mockImplementation(async (_s, interval, limit) => {
+      if (interval === '1d') throw new Error('1d 接口挂了')
+      return env.market.klines.slice(-limit)
+    })
+    const r = await run(env)
+    expect(r).toMatchObject({ error: null, outcome: 'hold' })
+    expect(r.outcomes).toHaveLength(2)
+    expect(env.llm!.calls[0]!.dailyKlines).toEqual([])
+  })
+
+  it('重试和超时统计：去掉 response_format 后重发不算重试；超时按固定文本识别', async () => {
+    const env = llmSetup([new DOMException('timeout', 'TimeoutError') as unknown as Error, act('hold')])
+    const { decision } = await run(env)
+    expect(decision).toMatchObject({ llmStatus: 'ok', llmRetries: 1, llmTimeouts: 1, llmHttp429: 0 })
+  })
+
   it('观望：记录这次询问，不交易', async () => {
     const env = llmSetup([act('hold', 30)])
     const { outcome, decision } = await run(env)
@@ -173,6 +191,29 @@ describe('LLM 模型', () => {
     env.engine.pause()
     expect(await run(env)).toMatchObject({ outcome: 'paused', decision: null })
     expect(env.llm!.calls).toHaveLength(0)
+  })
+
+  it('单个模型暂停：不问 LLM、不交易、止损也不执行，资产按当前价照常记录，排行榜跟着行情变；恢复后继续', async () => {
+    const env = llmSetup([act('buy', 40), act('hold')])
+    expect((await run(env)).outcome).toBe('filled')
+    env.store.setAgentStatus(env.llmAgentId!, 'paused', NOW)
+
+    // 跌破止损线：暂停中不卖，但资产快照按新价格记
+    advance(env, minutesLater(60))
+    env.market.price = env.market.price.mul('0.9')
+    const paused = await run(env)
+    expect(paused).toMatchObject({ outcome: 'paused', decision: null })
+    expect(env.llm!.calls).toHaveLength(1)
+    const ledger = env.state().getLedger()!
+    expect(env.store.latestEquity(env.season.id).get(env.agentId)).toMatchObject({
+      price: env.market.price.toFixed(),
+      total: ledger.usdt.plus(ledger.base.mul(env.market.price)).toFixed()
+    })
+
+    env.store.setAgentStatus(env.llmAgentId!, 'active', NOW)
+    advance(env, minutesLater(120))
+    env.market.price = env.market.price.mul('0.9')
+    expect((await run(env)).outcome).toBe('filled')
   })
 
   it('只看买卖：观望的询问记录不在其中', async () => {

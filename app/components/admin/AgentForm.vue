@@ -48,7 +48,7 @@ const providerItems = computed(() => props.providers.map(p => ({ label: p.name, 
 watch(open, (v) => {
   if (!v) return
   const a = props.agent
-  const used = new Set(props.agents.filter(x => x.status === 'active').map(x => x.color.toLowerCase()))
+  const used = new Set(props.agents.filter(x => x.status !== 'archived').map(x => x.color.toLowerCase()))
   Object.assign(state, {
     providerId: a?.providerId ?? props.providers[0]?.id,
     model: a?.model ?? '',

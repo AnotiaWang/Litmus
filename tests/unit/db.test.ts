@@ -102,6 +102,16 @@ describe('资产曲线与统计', () => {
     expect(store.hasActivity(a)).toBe(true)
   })
 
+  it('收益统计：t 值按相对一直持有的超额收益算；一直满仓跟着行情走的不算显著', () => {
+    // a 一直满仓，资产和价格同比例变化；b 一直空仓，价格上涨时跑输
+    const { store, season, a, b } = seeded(Array.from({ length: 10 }, (_, i) => [(50000 + i) / 500, 100] as [number, number]))
+    const stats = store.returnStats(season.id)
+    expect(stats.get(a)!.tStat).toBeNull()
+    expect(stats.get(a)!.periodVolPct).toBeGreaterThan(0)
+    expect(stats.get(b)!.tStat).toBeLessThan(-1.96)
+    expect(stats.get(b)!.periodVolPct).toBe(0)
+  })
+
   it('最近一次资产快照只看指定赛季：新赛季开始后查看旧赛季，取的是旧赛季最后一轮', () => {
     const { store, season: s1, a, b } = seeded([[100, 200], [110, null]])
     const s2 = store.startSeason('S2', testSeasonConfig(), new Date(NOW.getTime() + 3600_000))
@@ -153,6 +163,28 @@ describe('决策记录', () => {
     const { llmRaw: _raw, llmCalls: _calls, llmPrompt: _prompt, ...summary } = withDetails
     expect(items.find(d => d.id === 'd1')).toEqual(summary)
     expect(store.recentLlmDecisions(withDetails.seasonId, withDetails.agentId, 10).every(d => !('llmPrompt' in d))).toBe(true)
+  })
+
+  it('第 3 版数据库：补上成本单价、赛季版本和 LLM 重试统计列，旧赛季标成 legacy，旧记录的统计为 0', () => {
+    const path = tempDb()
+    const setup = new Store(path)
+    const d = decision(setup, 'old', false)
+    setup.insertDecision(d)
+    setup.close()
+    // 还原成第 3 版的样子：没有第 4 版加的列
+    const v3 = new DatabaseSync(path)
+    for (const [table, col] of [['agents', 'input_price_per_m'], ['agents', 'output_price_per_m'], ['seasons', 'prompt_version'], ['seasons', 'engine_version'],
+      ['decisions', 'llm_retries'], ['decisions', 'llm_http_429'], ['decisions', 'llm_timeouts']]) v3.exec(`ALTER TABLE ${table} DROP COLUMN ${col}`)
+    v3.exec(`UPDATE meta SET value = '3' WHERE key = 'schema_version'`)
+    v3.close()
+
+    const store = new Store(path)
+    expect(store.db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()).toEqual({ value: '4' })
+    expect(store.currentSeason()).toMatchObject({ promptVersion: 'legacy', engineVersion: 'legacy' })
+    expect(store.listAgents()[0]).toMatchObject({ inputPricePerM: null, outputPricePerM: null })
+    expect(store.getDecision('old')).toMatchObject({ llmRetries: 0, llmHttp429: 0, llmTimeouts: 0 })
+    store.close()
+    new Store(path).close()
   })
 
   it('第 2 版数据库：提示词等字段搬到 decision_details，decisions 表删掉这几列，记录完整可读', () => {
