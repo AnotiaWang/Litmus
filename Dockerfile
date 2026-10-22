@@ -1,7 +1,9 @@
 # 两阶段构建：第一阶段安装依赖并构建，第二阶段只保留构建产物 .output/
 # SQLite 用的是 Node 内置的 node:sqlite，不需要编译原生模块。
+# CVE-2026-111497（Brotli 解码器堆越界写）在 Node.js 24.22.1 修复。
+# 构建与运行阶段都钉在该补丁版本，不要改回浮动的 node:24-slim。
 
-FROM node:24-slim AS build
+FROM node:24.22.1-slim AS build
 WORKDIR /app
 RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
@@ -10,7 +12,7 @@ RUN pnpm install --frozen-lockfile --ignore-scripts
 COPY . .
 RUN pnpm build
 
-FROM node:24-slim
+FROM node:24.22.1-slim
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8000 \
